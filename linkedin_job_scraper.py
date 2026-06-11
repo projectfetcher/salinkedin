@@ -28,24 +28,86 @@ import openpyxl
 # =============================================================================
 
 SHEET_NAME  = "Sheet1"
-PAGES       = 1          # 1 page ≈ 25 results
-JOB_LIMIT   = 45
-DELAY_S     = 2.5        # seconds between requests
+DELAY_S     = 2.0        # seconds between requests (keep polite)
 FETCH_CHAR_LIMIT = 120_000
 
-SEARCH_BASE = "https://www.linkedin.com/jobs/search?keywords=&location=Saudi-Arabia&start="
+# ── Pagination ────────────────────────────────────────────────────────────────
+# LinkedIn returns 25 jobs per page. Set MAX_PAGES=0 to paginate until
+# LinkedIn stops returning new jobs (no hard cap).
+MAX_PAGES       = 0   # 0 = unlimited — paginate every query until dry
+MAX_EMPTY_PAGES = 3   # stop a query after this many consecutive zero-result pages
+JOB_LIMIT       = 0   # 0 = no cap; set e.g. 500 to limit total jobs written
+
+# ── Search queries ────────────────────────────────────────────────────────────
+# LinkedIn caps each query at ~1000 results. We run multiple keyword queries
+# so we can discover far more unique jobs across Saudi Arabia.
+# f_TPR=r604800 = posted in the last 7 days (remove to get all-time).
+_BASE = "https://www.linkedin.com/jobs/search?location=Saudi+Arabia&f_TPR=r604800"
+SEARCH_QUERIES = [
+    _BASE + "&keywords=&start=",
+    _BASE + "&keywords=engineer&start=",
+    _BASE + "&keywords=manager&start=",
+    _BASE + "&keywords=analyst&start=",
+    _BASE + "&keywords=developer&start=",
+    _BASE + "&keywords=accountant&start=",
+    _BASE + "&keywords=sales&start=",
+    _BASE + "&keywords=marketing&start=",
+    _BASE + "&keywords=HR&start=",
+    _BASE + "&keywords=nurse&start=",
+    _BASE + "&keywords=doctor&start=",
+    _BASE + "&keywords=driver&start=",
+    _BASE + "&keywords=teacher&start=",
+    _BASE + "&keywords=finance&start=",
+    _BASE + "&keywords=logistics&start=",
+    _BASE + "&keywords=construction&start=",
+    _BASE + "&keywords=procurement&start=",
+    _BASE + "&keywords=operations&start=",
+    _BASE + "&keywords=customer+service&start=",
+    _BASE + "&keywords=IT&start=",
+    _BASE + "&keywords=project+manager&start=",
+    _BASE + "&keywords=civil+engineer&start=",
+    _BASE + "&keywords=mechanical+engineer&start=",
+    _BASE + "&keywords=electrical+engineer&start=",
+    _BASE + "&keywords=data+scientist&start=",
+    _BASE + "&keywords=supply+chain&start=",
+    _BASE + "&keywords=security&start=",
+    _BASE + "&keywords=receptionist&start=",
+    _BASE + "&keywords=chef&start=",
+    _BASE + "&keywords=pharmacist&start=",
+]
+
+# LinkedIn guest API endpoint — returns raw HTML cards, more stable than the
+# main search page and bypasses some anti-bot blocks.
+LI_GUEST_API = (
+    "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+    "?location=Saudi+Arabia&f_TPR=r604800&keywords={kw}&start={start}"
+)
 
 OUTPUT_FILE = "jobs_output.xlsx"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+# ── Rotating User-Agents ──────────────────────────────────────────────────────
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
+_ua_idx = 0
+
+def _next_headers() -> dict:
+    global _ua_idx
+    ua = USER_AGENTS[_ua_idx % len(USER_AGENTS)]
+    _ua_idx += 1
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+    }
+
+HEADERS = _next_headers()   # default headers for code that references HEADERS directly
 
 # WordPress credentials (optional — set to empty strings to skip logo upload)
 WP_URL      = "https://mauritius.mimusjobs.com/wp-json/wp/v2/"
@@ -234,19 +296,30 @@ def decode_html_entities(s: str) -> str:
 #  HTTP
 # =============================================================================
 
-def fetch_page(url: str, follow_redirects: bool = True) -> str | None:
-    try:
-        time.sleep(0.3)
-        r = requests.get(url, headers=HEADERS, allow_redirects=follow_redirects, timeout=15)
-        if r.status_code != 200:
-            return None
-        text = r.text
-        if len(text) > FETCH_CHAR_LIMIT:
-            text = text[:FETCH_CHAR_LIMIT]
-        return text
-    except Exception as e:
-        log.warning(f"fetchPage failed ({url}): {e}")
-        return None
+def fetch_page(url: str, follow_redirects: bool = True, retries: int = 3) -> str | None:
+    for attempt in range(retries):
+        try:
+            time.sleep(0.3 + attempt * 1.5)
+            r = requests.get(url, headers=_next_headers(), allow_redirects=follow_redirects, timeout=20)
+            if r.status_code == 429:
+                wait = 30 + attempt * 30
+                log.warning(f"Rate limited (429) — waiting {wait}s before retry {attempt+1}/{retries}")
+                time.sleep(wait)
+                continue
+            if r.status_code == 403:
+                log.warning(f"403 Forbidden: {url}")
+                return None
+            if r.status_code != 200:
+                log.warning(f"HTTP {r.status_code}: {url}")
+                return None
+            text = r.text
+            if len(text) > FETCH_CHAR_LIMIT:
+                text = text[:FETCH_CHAR_LIMIT]
+            return text
+        except Exception as e:
+            log.warning(f"fetchPage attempt {attempt+1} failed ({url}): {e}")
+            time.sleep(2 + attempt * 2)
+    return None
 
 # =============================================================================
 #  NORMALISE DATE TEXT
@@ -1270,56 +1343,190 @@ def scrape_job_details(job_url: str) -> dict | None:
 #  MAIN CRAWL
 # =============================================================================
 
+def _collect_job_urls_from_page(html: str, seen: set) -> list:
+    """
+    Extract all job URLs from a LinkedIn search result page (HTML or API fragment).
+    Tries every known selector LinkedIn has used across different layouts.
+    Returns list of new (unseen) canonical job URLs.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    found = []
+
+    # All known link selectors across LinkedIn layouts
+    selectors = [
+        "a.base-card__full-link",
+        "a.base-main-card__full-link",
+        "a[data-tracking-control-name='public_jobs_jserp-name_click']",
+        "a[href*='/jobs/view/']",
+        "a.job-card-list__title",
+        "a.job-card-container__link",
+    ]
+
+    for sel in selectors:
+        for tag in soup.select(sel):
+            href = tag.get("href", "")
+            if not href or "/jobs/view/" not in href:
+                continue
+            # Canonicalise: strip query string, keep just the view URL
+            canonical = re.sub(r"\?.*$", "", href.split("?")[0])
+            if canonical not in seen:
+                seen.add(canonical)
+                found.append(href)   # keep original href (may have tracking params)
+
+    return found
+
+
+def _fetch_search_page(base_url: str, start: int, retries: int = 3) -> str | None:
+    """Fetch one page of LinkedIn search results with retry + back-off."""
+    url = base_url + str(start)
+    for attempt in range(retries):
+        try:
+            time.sleep(DELAY_S + attempt * 3)
+            r = requests.get(url, headers=_next_headers(), allow_redirects=True, timeout=25)
+            if r.status_code == 429:
+                wait = 60 + attempt * 60
+                print(C_RED(f"  ⏳ Rate limited (429) on list page — waiting {wait}s ..."))
+                log.warning(f"429 on {url} — sleeping {wait}s")
+                time.sleep(wait)
+                continue
+            if r.status_code in (403, 999):
+                log.warning(f"Blocked ({r.status_code}) on list page: {url}")
+                return None
+            if r.status_code != 200:
+                log.warning(f"HTTP {r.status_code} on list page: {url}")
+                return None
+            return r.text
+        except Exception as e:
+            log.warning(f"List page fetch error (attempt {attempt+1}): {e}")
+            time.sleep(3 + attempt * 3)
+    return None
+
+
+def _paginate_query(base_url: str, label: str, seen: set) -> list:
+    """
+    Paginate a single search query until LinkedIn returns no new results.
+    Returns list of job URLs found.
+    """
+    urls   = []
+    page   = 0
+    empty_streak = 0
+
+    while True:
+        if MAX_PAGES and page >= MAX_PAGES:
+            log.info(f"[{label}] Hit MAX_PAGES={MAX_PAGES}, stopping.")
+            break
+
+        start = page * 25
+        print(f"  {C_DIM(f'[{label}] page {page+1} (start={start}) ...')}", flush=True)
+        html = _fetch_search_page(base_url, start)
+
+        if not html:
+            empty_streak += 1
+            log.warning(f"[{label}] No HTML on page {page+1} (streak={empty_streak})")
+            if empty_streak >= MAX_EMPTY_PAGES:
+                break
+            page += 1
+            continue
+
+        new_urls = _collect_job_urls_from_page(html, seen)
+        log.info(f"[{label}] page {page+1}: {len(new_urls)} new URLs (total seen={len(seen)})")
+
+        if new_urls:
+            urls.extend(new_urls)
+            empty_streak = 0
+        else:
+            empty_streak += 1
+            log.info(f"[{label}] Zero new URLs (streak={empty_streak})")
+            if empty_streak >= MAX_EMPTY_PAGES:
+                log.info(f"[{label}] {MAX_EMPTY_PAGES} empty pages in a row — query exhausted.")
+                break
+
+        # LinkedIn hard-caps search results at 1000 (40 pages × 25)
+        if start >= 975:
+            log.info(f"[{label}] Reached LinkedIn's 1000-result cap.")
+            break
+
+        page += 1
+        # Longer pause every 10 pages to avoid rate-limiting
+        if page % 10 == 0:
+            pause = 15
+            print(C_DIM(f"  Pausing {pause}s every 10 pages ..."))
+            time.sleep(pause)
+
+    return urls
+
+
 def craw():
     start_time = time.time()
-    log.info(f"SCRAPE STARTED: {datetime.now()}")
+    print()
+    print(C_HEADER("=" * 72))
+    print(C_HEADER("  LINKEDIN JOB SCRAPER — Saudi Arabia"))
+    print(C_HEADER("=" * 72))
+    print(f"  Queries     : {len(SEARCH_QUERIES)}")
+    print(f"  Max pages   : {'unlimited' if not MAX_PAGES else MAX_PAGES} per query")
+    print(f"  Job cap     : {'none' if not JOB_LIMIT else JOB_LIMIT}")
+    print(f"  Started     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(C_HEADER("=" * 72))
+    log.info(f"SCRAPE STARTED")
 
-    result   = []
-    seen_urls = set()
+    seen_urls = set()   # canonical URLs (no query string) — dedup across all queries
+    all_job_hrefs = []  # original hrefs (with tracking params) for scraping
 
-    for i in range(PAGES):
-        list_url = SEARCH_BASE + str(i * 25)
-        log.info(f"Fetching list page {i+1}: {list_url}")
-        try:
-            resp = requests.get(list_url, headers=HEADERS, timeout=15)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            found = 0
-            for a in soup.select("#main-content > section > ul > li > div > a, a.base-card__full-link"):
-                href = a.get("href", "")
-                if not href:
-                    continue
-                key = href.split("?")[0]
-                if key not in seen_urls:
-                    seen_urls.add(key)
-                    result.append(href)
-                    found += 1
-            log.info(f"Page {i+1}: found {found} new URLs")
-        except Exception as e:
-            log.warning(f"List page error: {e}")
-        time.sleep(DELAY_S)
+    # ── Phase 1 : Collect all job URLs across all search queries ─────────────
+    for qi, base_url in enumerate(SEARCH_QUERIES):
+        # Extract keyword label from URL for display
+        kw_m  = re.search(r"keywords=([^&]*)", base_url)
+        label = kw_m.group(1).replace("+", " ") if kw_m and kw_m.group(1) else "all"
+        print()
+        print(C_BLUE(f"┌─ Query {qi+1}/{len(SEARCH_QUERIES)}: keyword='{label}' ─────────────────"))
 
-    log.info(f"Total unique job URLs: {len(result)}")
-    result = result[:JOB_LIMIT]
-    log.info(f"Capped to: {len(result)} jobs")
+        new_hrefs = _paginate_query(base_url, label, seen_urls)
+        all_job_hrefs.extend(new_hrefs)
 
+        print(C_BLUE(f"└─ Found {len(new_hrefs)} new jobs (running total: {len(all_job_hrefs)})"))
+
+        if JOB_LIMIT and len(all_job_hrefs) >= JOB_LIMIT:
+            log.info(f"JOB_LIMIT={JOB_LIMIT} reached during collection — stopping queries.")
+            break
+
+        # Polite pause between queries
+        time.sleep(DELAY_S * 2)
+
+    if JOB_LIMIT and len(all_job_hrefs) > JOB_LIMIT:
+        all_job_hrefs = all_job_hrefs[:JOB_LIMIT]
+
+    print()
+    print(C_HEADER(f"  Total unique job URLs collected: {len(all_job_hrefs)}"))
+    print()
+
+    # ── Phase 2 : Scrape each job detail page ────────────────────────────────
     jobs, errors = [], 0
-    for j, url in enumerate(result):
-        print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(result)} ...')}")
+    for j, url in enumerate(all_job_hrefs):
+        print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(all_job_hrefs)} ...')}")
         log.info(f"URL: {url}")
         try:
             job = scrape_job_details(url)
             if job and job.get("jobTitle"):
                 jobs.append(job)
-                print_job_verbose(job, j + 1, len(result))
+                print_job_verbose(job, j + 1, len(all_job_hrefs))
             else:
-                print(C_RED(f"  ✗  No title found — skipped"))
+                print(C_RED("  ✗  No title found — skipped"))
         except Exception as e:
             errors += 1
             print(C_RED(f"  ✗  ERROR: {e}"))
             log.warning(f"Job error: {e}")
+
         time.sleep(DELAY_S)
 
-    # ── Final summary banner ──────────────────────────────────────────────────
+        # Save incrementally every 50 jobs so progress isn't lost on crash
+        if len(jobs) % 50 == 0 and len(jobs) > 0:
+            _save_excel(jobs)
+            log.info(f"Incremental save: {len(jobs)} jobs written so far.")
+
+    # ── Final save ────────────────────────────────────────────────────────────
+    _save_excel(jobs)
+
+    # ── Summary banner ────────────────────────────────────────────────────────
     mins = round((time.time() - start_time) / 60, 1)
     print()
     print(C_HEADER("=" * 72))
@@ -1330,29 +1537,29 @@ def craw():
     print(f"  {C_LABEL('Duration')}       : ~{mins} min")
     print(f"  {C_LABEL('Output file')}    : {OUTPUT_FILE}")
 
-    # ── Field breakdown ───────────────────────────────────────────────────────
     if jobs:
         from collections import Counter
         fields = Counter(j.get("jobField") or "Unknown" for j in jobs)
-        print(f"\n  {C_LABEL('Jobs by field:')}")
+        print(f"\n  {C_LABEL('Jobs by field:')} ")
         for field, count in fields.most_common():
-            bar = "█" * count
+            bar = "█" * min(count, 40)
             print(f"    {field:<35} {C_GREEN(bar)} {count}")
 
-        # ── Apply method breakdown ────────────────────────────────────────────
         with_apply = sum(1 for j in jobs if j.get("application"))
         with_email = sum(1 for j in jobs if "@" in (j.get("application") or ""))
         with_url   = with_apply - with_email
         no_apply   = len(jobs) - with_apply
-        print(f"\n  {C_LABEL('Application links:')}")
+        print(f"\n  {C_LABEL('Application links:')} ")
         print(f"    URL found    : {with_url}")
         print(f"    Email found  : {with_email}")
         print(f"    Not found    : {no_apply}")
 
     print(C_HEADER("=" * 72))
-    log.info(f"Scraped {len(jobs)} jobs, {errors} errors")
+    log.info(f"Scraped {len(jobs)} jobs, {errors} errors, {mins} min")
 
-    # ── Write to Excel ────────────────────────────────────────────────────────
+
+def _save_excel(jobs: list):
+    """Write all jobs to the output Excel file (overwrites previous)."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = SHEET_NAME
@@ -1378,8 +1585,7 @@ def craw():
         ])
 
     wb.save(OUTPUT_FILE)
-    log.info(f"Written {len(jobs)} rows to {OUTPUT_FILE}")
-    log.info(f"DONE in ~{mins} min")
+    log.info(f"Saved {len(jobs)} rows to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
