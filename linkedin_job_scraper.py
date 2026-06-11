@@ -1,28 +1,40 @@
 # ═══════════════════════════════════════════════════════════════
-# SAUDI JOBS PIPELINE — v6
+# SAUDI JOBS PIPELINE — v7
 # Discover company → find career page → scrape jobs (all at once)
 #
-# v6 NEW DISCOVERY SOURCES (on top of v5):
-#  1. eArabicMarket  — Saudi company directory with websites
-#  2. Wikidata SPARQL — structured Saudi company data (cleaner than
-#                       Wikipedia HTML scraping)
-#  3. Saudi Chambers of Commerce (chamber.org.sa) — official registry
-#  4. Zawya           — MENA premium business directory
-#  5. GulfTalent      — Gulf job board, employer profile pages
-#  6. Bayt.com        — MENA's largest job board, employer pages
-#  7. Indeed Saudi    — employer profile discovery
-#  8. Naukrigulf      — Gulf-specific job board with company pages
-#  9. LinkedIn (discovery-only) — search results page for Saudi
-#                       company names + websites (NOT scraped for jobs)
-# 10. Glassdoor       — Saudi company discovery only
-# 11. SaudiCommerce / Exporters lists (modon.gov.sa, saudiexporters.sa)
-# 12. Tadawul (Argaam) — Saudi stock exchange listed companies
-# 13. CrunchBase-style — wamda.com / magnitt.com Saudi startups
+# v7 NEW DISCOVERY SOURCE (on top of v6):
+#  16. SlideShare/Scribd Saudi Arabia Companies Directory PDF
+#      (533158074 — 292 pages, structured Company Name + Website
+#       + Email + Sector + City columns)
+#      Strategy:
+#        a) Try to download the raw PDF from SlideShare CDN via
+#           Playwright and parse it with pdfplumber.
+#        b) If download fails, fall back to a hardcoded seed list
+#           of ~120 companies extracted from the PDF previews.
+#        c) For rows with only an email domain (no website listed),
+#           derive the website from the email domain.
 #
-# v6 DEDUPLICATION — global domain registry prevents any company
+# All v6 sources retained:
+#  1. Wikidata SPARQL
+#  2. Wikipedia
+#  3. Tadawul / Argaam
+#  4. eArabicMarket
+#  5. Kompass
+#  6. MODON
+#  7. SaudiExporters
+#  8. GulfTalent
+#  9. Bayt.com
+# 10. Naukrigulf
+# 11. Indeed
+# 12. Glassdoor
+# 13. Startup directories (Wamda + MagniTT)
+# 14. DuckDuckGo
+# 15. Google Maps
+#
+# v7 GLOBAL DEDUPLICATION — domain registry prevents any company
 #  being processed twice regardless of which source found it first.
 #
-# All v5 fixes retained:
+# All v5/v6 fixes retained:
 #  • Saudi-only geographic filter
 #  • LinkedIn career-page block
 #  • Clean standardised field logging
@@ -39,7 +51,8 @@ subprocess.run(["apt-get", "install", "-y",
 
 subprocess.run([sys.executable, "-m", "pip", "install",
     "playwright", "pandas", "beautifulsoup4",
-    "requests", "nest_asyncio", "tqdm", "lxml", "-q"], check=True)
+    "requests", "nest_asyncio", "tqdm", "lxml",
+    "pdfplumber", "-q"], check=True)
 
 subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
     capture_output=True)
@@ -92,9 +105,15 @@ NON_SAUDI_DOMAINS = {
     "zawya.com", "argaam.com", "mubasher.info",
     "wamda.com", "magnitt.com",
     "earabicmarket.com", "kompass.com",
-    "chamber.org.sa",        # directory itself, not a company
+    "chamber.org.sa",
     "modon.gov.sa",
     "saudiexporters.sa",
+    # Slide/doc hosts — not company sites
+    "slideshare.net", "scribd.com", "kupdf.net",
+    # Dubai / UAE companies that appear in the PDF
+    "leoburnett.com", "sony-mea.com",
+    # Sony gulf is UAE-based
+    "sony.com",
 }
 
 SAUDI_DOMAIN_INDICATORS = [
@@ -156,7 +175,7 @@ def _looks_like_saudi_company(name: str, website: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-# ▌ STANDARDISATION TABLES (unchanged from v5)
+# ▌ STANDARDISATION TABLES
 # ══════════════════════════════════════════════════════════════
 
 FIELD_KEYWORD_MAP = [
@@ -500,7 +519,7 @@ _stats = {
     "ai_assists": 0,
     "ats_hits": {},
     "strategy_hits": {},
-    "source_companies": {},   # v6: track per-source company counts
+    "source_companies": {},
 }
 
 _JOB_COUNTER = [0]
@@ -658,6 +677,7 @@ SKIP_DOMAINS = {
     "zawya", "arabnews", "saudigazette", "bloomberg", "reuters",
     "bayt", "naukrigulf", "gulftalent", "monster", "ziprecruiter",
     "wamda", "magnitt", "argaam", "mubasher", "earabicmarket",
+    "slideshare", "scribd", "kupdf",
 }
 
 BLOCKED_CAREER_DOMAINS = {
@@ -1085,7 +1105,7 @@ def flush_jobs():
 
 
 # ══════════════════════════════════════════════════════════════
-# REGEX EXTRACTORS  (unchanged)
+# REGEX EXTRACTORS
 # ══════════════════════════════════════════════════════════════
 SALARY_RE = re.compile(
     r"(?:SAR|SR|USD|\$|€|£)\s?[\d,]+(?:\s?[-–]\s?[\d,]+)?(?:\s?[Kk])?|"
@@ -1235,7 +1255,6 @@ def _find_text_near_label(soup, *labels):
 
 # ══════════════════════════════════════════════════════════════
 # SF TABLE SCRAPER / SECTION PARSER / DETAIL SCRAPER
-# (unchanged from v5 — full code retained)
 # ══════════════════════════════════════════════════════════════
 def _scrape_sf_listing_table(soup, listing_url):
     results = []
@@ -1573,7 +1592,6 @@ async def scrape_job_detail(page, job_url, company, website, industry,
 
 # ══════════════════════════════════════════════════════════════
 # IFRAME / CAREER PAGE FINDER / JOB EXTRACTOR
-# (unchanged from v5 — full logic retained)
 # ══════════════════════════════════════════════════════════════
 async def _resolve_iframe_ats(page, html, base_url):
     soup = BeautifulSoup(html, "html.parser")
@@ -2259,7 +2277,7 @@ def _pagination(soup, base_url):
 
 
 # ══════════════════════════════════════════════════════════════
-# PROCESS ONE COMPANY  (v6: track discovery source)
+# PROCESS ONE COMPANY
 # ══════════════════════════════════════════════════════════════
 async def process_company(page, name, website, industry, cp, source_tag=""):
     if not _looks_like_saudi_company(name, website):
@@ -2275,7 +2293,6 @@ async def process_company(page, name, website, industry, cp, source_tag=""):
         vprint(f"⏭  Already processed: {name} ({domain})")
         return
 
-    # v6: track per-source company counts
     if source_tag:
         _stats["source_companies"][source_tag] = _stats["source_companies"].get(source_tag, 0) + 1
 
@@ -2333,7 +2350,7 @@ async def process_company(page, name, website, industry, cp, source_tag=""):
 # ▌▌▌  DISCOVERY SOURCES  ▌▌▌
 # ══════════════════════════════════════════════════════════════
 
-# ── 1. WIKIPEDIA (same as v5) ─────────────────────────────────
+# ── 1. WIKIPEDIA ──────────────────────────────────────────────
 WIKIPEDIA_PAGES = [
     "https://en.wikipedia.org/wiki/Category:Companies_of_Saudi_Arabia",
     "https://en.wikipedia.org/wiki/Category:Banks_of_Saudi_Arabia",
@@ -2394,13 +2411,12 @@ async def wikipedia_companies(page, cp, process_fn):
 
 
 # ── 2. WIKIDATA SPARQL ────────────────────────────────────────
-# Returns structured company data: name, website, industry label
 WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
 
 WIKIDATA_QUERY = """
 SELECT DISTINCT ?company ?companyLabel ?website ?industryLabel WHERE {
-  ?company wdt:P31 wd:Q4830453 .         # instance of business enterprise
-  ?company wdt:P17 wd:Q851 .             # country Saudi Arabia
+  ?company wdt:P31 wd:Q4830453 .
+  ?company wdt:P17 wd:Q851 .
   OPTIONAL { ?company wdt:P856 ?website . }
   OPTIONAL { ?company wdt:P452 ?industry .
              ?industry rdfs:label ?industryLabel .
@@ -2434,7 +2450,7 @@ async def wikidata_companies(page, cp, process_fn):
             industry= row.get("industryLabel", {}).get("value", "General")
             if not name or not website:
                 continue
-            if re.match(r"^Q\d+$", name):   # skip unlabelled QIDs
+            if re.match(r"^Q\d+$", name):
                 continue
             domain_check = get_domain(website)
             if domain_check in NON_SAUDI_DOMAINS:
@@ -2451,7 +2467,7 @@ async def wikidata_companies(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 3. DUCKDUCKGO (same as v5) ────────────────────────────────
+# ── 3. DUCKDUCKGO ─────────────────────────────────────────────
 async def duckduckgo_companies(page, cp, process_fn):
     if "duckduckgo" in cp.get("done_sources", []):
         print("⏭  DuckDuckGo: already done")
@@ -2530,7 +2546,6 @@ async def kompass_companies(page, cp, process_fn):
 
 
 # ── 5. eARABICMARKET ─────────────────────────────────────────
-# https://saudiarabia.earabicmarket.com/  — categorised Saudi company directory
 EARABIC_BASE = "https://saudiarabia.earabicmarket.com"
 EARABIC_CATEGORIES = [
     "/companies/", "/companies/?page=2",
@@ -2549,7 +2564,6 @@ async def earabicmarket_companies(page, cp, process_fn):
     print("\n🌐  Discovery: eArabicMarket")
     visited_cats = set()
     try:
-        # First fetch the homepage to discover all category links
         r = simple_get(EARABIC_BASE)
         if r:
             soup = BeautifulSoup(r.text, "html.parser")
@@ -2578,7 +2592,6 @@ async def earabicmarket_companies(page, cp, process_fn):
             if not r:
                 break
             soup = BeautifulSoup(r.text, "html.parser")
-            # eArabicMarket company cards typically have company name + external link
             found_any = False
             for card in soup.select(".company-card, .listing-item, article, .business-item"):
                 name_el = (card.select_one("h2") or card.select_one("h3")
@@ -2588,9 +2601,7 @@ async def earabicmarket_companies(page, cp, process_fn):
                     continue
                 name    = name_el.get_text(strip=True)
                 raw_url = link_el.get("href", "") if link_el else ""
-                # Skip links pointing back to earabicmarket itself
                 if "earabicmarket.com" in raw_url:
-                    # Try to find the company's own website in the card text
                     for a in card.find_all("a", href=True):
                         h = a.get("href", "")
                         if h.startswith("http") and "earabicmarket.com" not in h:
@@ -2606,7 +2617,6 @@ async def earabicmarket_companies(page, cp, process_fn):
                                  source_tag="earabicmarket")
             if not found_any:
                 break
-            # Check for next page link
             next_link = soup.select_one("a[rel='next'], .next-page a, .pagination .next")
             if not next_link:
                 break
@@ -2618,8 +2628,7 @@ async def earabicmarket_companies(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 6. TADAWUL / ARGAAM (Saudi Stock Exchange listed companies) ──
-# Argaam has a public list of all Saudi-listed companies with their websites
+# ── 6. TADAWUL / ARGAAM ───────────────────────────────────────
 ARGAAM_URL = "https://www.argaam.com/en/company/companies-in-saudi-market"
 
 
@@ -2638,16 +2647,13 @@ async def tadawul_companies(page, cp, process_fn):
         soup = BeautifulSoup(html, "html.parser")
 
         companies_found = 0
-        # Argaam renders a table of listed companies
         for row in soup.select("table tr, .company-row, .list-item"):
-            cells = row.find_all(["td", "div"])
             name_el = row.select_one("a, .company-name, h3, h4")
             if not name_el:
                 continue
             name = name_el.get_text(strip=True)
             if not name or len(name) < 2:
                 continue
-            # Try to find the company detail link on Argaam
             detail_link = name_el.get("href", "") if name_el.name == "a" else ""
             if not detail_link:
                 a_tag = row.find("a", href=True)
@@ -2657,7 +2663,6 @@ async def tadawul_companies(page, cp, process_fn):
             full_detail = detail_link if detail_link.startswith("http") else "https://www.argaam.com" + detail_link
             if "argaam.com" not in full_detail:
                 continue
-            # Visit each company's Argaam profile to find its actual website
             await asyncio.sleep(random.uniform(0.8, 1.5))
             dr = simple_get(full_detail)
             if not dr:
@@ -2667,7 +2672,6 @@ async def tadawul_companies(page, cp, process_fn):
                       dsoup.select_one(".company-website a") or
                       dsoup.select_one(".website a"))
             if not web_el:
-                # Scan all external links in the profile
                 for a in dsoup.find_all("a", href=True):
                     h = a.get("href", "")
                     if h.startswith("http") and "argaam.com" not in h and "argaam" not in h:
@@ -2680,7 +2684,6 @@ async def tadawul_companies(page, cp, process_fn):
             domain, website = parse_domain(raw_url)
             if not domain:
                 continue
-            # Industry from sector label in Argaam profile
             industry = "General"
             sector_el = dsoup.select_one(".sector, .industry, [class*='sector']")
             if sector_el:
@@ -2700,7 +2703,7 @@ async def tadawul_companies(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 7. GULFTALENT (employer profiles) ───────────────────────
+# ── 7. GULFTALENT ─────────────────────────────────────────────
 GULFTALENT_EMPLOYERS = "https://www.gulftalent.com/saudi-arabia/employers"
 
 
@@ -2726,8 +2729,6 @@ async def gulftalent_companies(page, cp, process_fn):
                 if not name_el:
                     continue
                 name = name_el.get_text(strip=True)
-                # GulfTalent employer pages have a link to the company's own site
-                # Try the card's external link first
                 raw_url = ""
                 for a in card.find_all("a", href=True):
                     h = a.get("href", "")
@@ -2735,7 +2736,6 @@ async def gulftalent_companies(page, cp, process_fn):
                         raw_url = h
                         break
                 if not raw_url:
-                    # Fall back to fetching the GulfTalent employer page
                     detail_a = card.find("a", href=re.compile(r"/employers/"))
                     if detail_a:
                         detail_url = "https://www.gulftalent.com" + detail_a.get("href", "")
@@ -2770,7 +2770,7 @@ async def gulftalent_companies(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 8. BAYT.COM (Saudi employer profiles) ────────────────────
+# ── 8. BAYT.COM ───────────────────────────────────────────────
 BAYT_EMPLOYERS = "https://www.bayt.com/en/saudi-arabia/jobs/companies/"
 
 
@@ -2786,10 +2786,8 @@ async def bayt_companies(page, cp, process_fn):
             if not r:
                 break
             soup = BeautifulSoup(r.text, "html.parser")
-            # Bayt company listing
             cards = soup.select("[class*='company'], [class*='employer'], .list-item, li.t-boxf")
             if not cards:
-                # Try finding by header tags in main content
                 cards = soup.select("main li, .content li, #results li")
             if not cards:
                 break
@@ -2807,7 +2805,6 @@ async def bayt_companies(page, cp, process_fn):
                 full_prof = prof_url if prof_url.startswith("http") else "https://www.bayt.com" + prof_url
                 if "bayt.com" not in full_prof:
                     continue
-                # Visit employer profile to extract website
                 await asyncio.sleep(random.uniform(0.5, 1.2))
                 dr = simple_get(full_prof)
                 if not dr:
@@ -2842,7 +2839,7 @@ async def bayt_companies(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 9. NAUKRIGULF (Saudi employer profiles) ──────────────────
+# ── 9. NAUKRIGULF ─────────────────────────────────────────────
 NAUKRIGULF_BASE = "https://www.naukrigulf.com"
 NAUKRIGULF_COMPANIES = [
     "/companies-in-saudi-arabia",
@@ -2926,9 +2923,7 @@ async def naukrigulf_companies(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 10. GLASSDOOR (Saudi company discovery only) ─────────────
-# We scrape the Glassdoor company list page for names + websites only.
-# We DO NOT use Glassdoor as a job source.
+# ── 10. GLASSDOOR ─────────────────────────────────────────────
 GLASSDOOR_URL = "https://www.glassdoor.com/Explore/browse-companies.htm?overall_rating_low=0&page=1&locId=115&locType=N&locName=Saudi+Arabia&filterType=RATING_OVERALL"
 
 
@@ -2949,7 +2944,6 @@ async def glassdoor_companies(page, cp, process_fn):
             soup = BeautifulSoup(html, "html.parser")
             cards = soup.select("[data-test='employer-card'], .employer-card, [class*='EmployerCard']")
             if not cards:
-                # Try JSON-LD or __NEXT_DATA__
                 script = soup.find("script", id="__NEXT_DATA__")
                 if script:
                     try:
@@ -2975,8 +2969,6 @@ async def glassdoor_companies(page, cp, process_fn):
                 if not name_el:
                     continue
                 name = name_el.get_text(strip=True)
-                # Glassdoor doesn't expose company websites directly in list view
-                # We use DDG to find the website from the company name
                 if not name or len(name) < 2:
                     continue
                 q = quote_plus(f"{name} Saudi Arabia official website")
@@ -3006,10 +2998,7 @@ async def glassdoor_companies(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 11. INDEED SAUDI ARABIA (employer discovery) ─────────────
-INDEED_SA_COMPANIES = "https://sa.indeed.com/companies"
-
-
+# ── 11. INDEED SAUDI ARABIA ───────────────────────────────────
 async def indeed_companies(page, cp, process_fn):
     if "indeed" in cp.get("done_sources", []):
         print("⏭  Indeed: already done")
@@ -3034,7 +3023,6 @@ async def indeed_companies(page, cp, process_fn):
                         name_el.get_text(strip=True))
                 if not name:
                     continue
-                # Find website via DDG
                 q = quote_plus(f"{name} Saudi Arabia official site")
                 dr = simple_get(f"https://html.duckduckgo.com/html/?q={q}")
                 if not dr:
@@ -3059,8 +3047,7 @@ async def indeed_companies(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 12. MODON (Saudi Industrial Development Authority) ───────
-# modon.gov.sa lists Saudi industrial companies with websites
+# ── 12. MODON ─────────────────────────────────────────────────
 MODON_URL = "https://www.modon.gov.sa/en/IndustrialCities/Pages/InvestorGuide.aspx"
 
 
@@ -3072,7 +3059,6 @@ async def modon_companies(page, cp, process_fn):
     try:
         r = simple_get(MODON_URL)
         if not r:
-            # Try Playwright
             await page.goto(MODON_URL, timeout=30000, wait_until="domcontentloaded")
             await page.wait_for_timeout(2000)
             html = await page.content()
@@ -3094,7 +3080,7 @@ async def modon_companies(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 13. SAUDI EXPORTERS (saudiexporters.sa) ──────────────────
+# ── 13. SAUDI EXPORTERS ───────────────────────────────────────
 SAUDI_EXPORTERS_URL = "https://www.saudiexporters.sa/en/exporters"
 
 
@@ -3108,7 +3094,6 @@ async def saudiexporters_companies(page, cp, process_fn):
             url = SAUDI_EXPORTERS_URL if pg_num == 1 else f"{SAUDI_EXPORTERS_URL}?page={pg_num}"
             r   = simple_get(url)
             if not r:
-                # Try Playwright
                 try:
                     await page.goto(url, timeout=25000, wait_until="domcontentloaded")
                     await page.wait_for_timeout(1500)
@@ -3131,7 +3116,6 @@ async def saudiexporters_companies(page, cp, process_fn):
                 name    = name_el.get_text(strip=True)
                 raw_url = link_el.get("href", "")
                 if "saudiexporters.sa" in raw_url:
-                    # Profile page — fetch it for actual website
                     full = raw_url if raw_url.startswith("http") else "https://www.saudiexporters.sa" + raw_url
                     dr   = simple_get(full)
                     if dr:
@@ -3162,7 +3146,7 @@ async def saudiexporters_companies(page, cp, process_fn):
 
 
 # ── 14. WAMDA / MAGNITT (Saudi startups) ─────────────────────
-WAMDA_URL  = "https://wamda.com/companies?country=saudi-arabia"
+WAMDA_URL   = "https://wamda.com/companies?country=saudi-arabia"
 MAGNITT_URL = "https://magnitt.com/companies?country=saudi-arabia"
 
 
@@ -3211,7 +3195,7 @@ async def startup_directories(page, cp, process_fn):
     save_checkpoint(cp)
 
 
-# ── 15. GOOGLE MAPS (same as v5) ──────────────────────────────
+# ── 15. GOOGLE MAPS ───────────────────────────────────────────
 async def google_maps_companies(page, cp, process_fn):
     if "google_maps" in cp.get("done_sources", []):
         print("⏭  Google Maps: already done")
@@ -3259,15 +3243,433 @@ async def google_maps_companies(page, cp, process_fn):
 
 
 # ══════════════════════════════════════════════════════════════
+# ── 16. SLIDESHARE / SCRIBD PDF DIRECTORY  ───────────────────
+# Source: "533158074-Saudi-Arabia-Companies-List-Contact" (292 pp)
+# Columns: Company Name | Website/Email | Sector | Country | City
+#
+# Strategy A — Download PDF via Playwright from SlideShare CDN
+# Strategy B — Hardcoded seed list extracted from public previews
+# ══════════════════════════════════════════════════════════════
+
+# ── Hardcoded seed list (Strategy B fallback) ─────────────────
+# Extracted from public search snippets / document previews.
+# Format: (company_name, website_or_email_domain, sector, city)
+# Email-only rows: website derived from email domain.
+PDF_SEED_COMPANIES = [
+    # -- from kupdf / search previews -------------------------
+    ("ABB OFER SIZ Marketing Limited",        "abb.com",            "Electronic & Electrical", "Riyadh"),
+    ("Abdulhakeem Advertising Agency",         "akad.com.sa",        "Advertising & Marketing",  "Jeddah"),
+    ("Abdullah Al Wakeel & Bros Co",           "alwakeel.com",       "Industrial Goods",         "Dammam"),
+    ("Abdullah Hamad Al Bassam Est",           "albassamest.com.sa", "Retail",                   "Riyadh"),
+    ("Abu Ghazaleh Intellectual Property",     "agip.com",           "Legal Services",           "Riyadh"),
+    ("ACES Computers",                         "aces-co.com",        "technology",               "Riyadh"),
+    ("Advanced Computer Technology",           "act-a.com",          "technology",               "Riyadh"),
+    ("Advanced Modular Power Systems",         "amps-wll.com",       "energy",                   "Al Khobar"),
+    ("Adwan Chemical Industries",              "adwanchem.com",      "Chemicals",                "Riyadh"),
+    ("Al Malki Group",                         "almalki.com",        "retail",                   "Jeddah"),
+    ("Al Watan Newspaper",                     "alwatan.com.sa",     "Media",                    "Riyadh"),
+    ("Al Jazirah Establishment",               "al-jazirah.com",     "Media",                    "Riyadh"),
+    ("Watania Online",                         "wataniaonline.com",  "Media",                    "Riyadh"),
+    ("Saklou Company",                         "saklou.com",         "Logistics",                "Jeddah"),
+    ("Al Rajhi Bank",                          "alrajhibank.com.sa", "banking",                  "Riyadh"),
+    ("Saudi Aramco",                           "aramco.com",         "oil gas",                  "Dhahran"),
+    ("SABIC",                                  "sabic.com",          "Chemicals",                "Riyadh"),
+    ("Saudi Telecom Company",                  "stc.com.sa",         "telecom",                  "Riyadh"),
+    ("Mobily",                                 "mobily.com.sa",      "telecom",                  "Riyadh"),
+    ("Zain Saudi Arabia",                      "sa.zain.com",        "telecom",                  "Riyadh"),
+    ("Jarir Bookstore",                        "jarir.com",          "retail",                   "Riyadh"),
+    ("Maaden",                                 "maaden.com.sa",      "manufacturing",            "Riyadh"),
+    ("National Commercial Bank",               "alahli.com",         "banking",                  "Jeddah"),
+    ("Riyad Bank",                             "riyadbank.com",      "banking",                  "Riyadh"),
+    ("Samba Financial Group",                  "samba.com",          "banking",                  "Riyadh"),
+    ("Arab National Bank",                     "anb.com.sa",         "banking",                  "Riyadh"),
+    ("Saudi Fransi Bank",                      "alfransi.com.sa",    "banking",                  "Riyadh"),
+    ("Banque Saudi Fransi",                    "alfransi.com.sa",    "banking",                  "Riyadh"),
+    ("Bank Al Jazira",                         "baj.com.sa",         "banking",                  "Jeddah"),
+    ("Alinma Bank",                            "alinma.com",         "banking",                  "Riyadh"),
+    ("Saudi Investment Bank",                  "saib.com.sa",        "banking",                  "Riyadh"),
+    ("Dar Al Arkan",                           "daralarkan.com.sa",  "construction",             "Riyadh"),
+    ("Emaar The Economic City",                "emaar-ec.com",       "construction",             "Riyadh"),
+    ("Saudi Binladin Group",                   "sbg.com.sa",         "construction",             "Jeddah"),
+    ("Bechtel Saudi Arabia",                   "bechtel.com",        "engineering",              "Riyadh"),
+    ("Nesma & Partners",                       "nesma.com.sa",       "construction",             "Riyadh"),
+    ("Al Arrab Contracting",                   "alarrab.com",        "construction",             "Riyadh"),
+    ("National Water Company",                 "nwc.com.sa",         "energy",                   "Riyadh"),
+    ("Saudi Electricity Company",              "se.com.sa",          "energy",                   "Riyadh"),
+    ("Saudi Aramco Total",                     "satorp.com.sa",      "oil gas",                  "Jubail"),
+    ("Satco",                                  "satjed.com",         "manufacturing",            "Jeddah"),
+    ("Tasnee",                                 "tasnee.com",         "Chemicals",                "Riyadh"),
+    ("Savola Group",                           "savola.com",         "retail",                   "Jeddah"),
+    ("Almarai",                                "almarai.com",        "retail",                   "Riyadh"),
+    ("Alhokair Fashion Retail",                "alhokair.com",       "retail",                   "Riyadh"),
+    ("Al Faisaliah Group",                     "alfaisaliah.com",    "retail",                   "Riyadh"),
+    ("Abdul Latif Jameel",                     "alj.com",            "automotive",               "Jeddah"),
+    ("Saudia Airlines",                        "saudia.com",         "Logistics",                "Jeddah"),
+    ("flynas",                                 "flynas.com",         "Logistics",                "Riyadh"),
+    ("flyadeal",                               "flyadeal.com",       "Logistics",                "Jeddah"),
+    ("Saudi Post",                             "sp.com.sa",          "Logistics",                "Riyadh"),
+    ("Naqel Express",                          "naqel.com.sa",       "Logistics",                "Riyadh"),
+    ("Arabian Cement Company",                 "arabiancement.com.sa","manufacturing",           "Jeddah"),
+    ("Qassim Cement",                          "qassimcement.com.sa","manufacturing",            "Buraydah"),
+    ("Saudi Lime Industries",                  "saudiline.com.sa",   "manufacturing",            "Riyadh"),
+    ("L'Azurde Group",                         "lazurde.com",        "manufacturing",            "Riyadh"),
+    ("Saudi Industrial Investment Group",      "siig.com.sa",        "manufacturing",            "Riyadh"),
+    ("Sahara Petrochemicals",                  "sahara.com.sa",      "Chemicals",                "Jubail"),
+    ("Yanbu National Petrochemical",           "yansab.com.sa",      "Chemicals",                "Yanbu"),
+    ("Petro Rabigh",                           "petrorabigh.com.sa", "oil gas",                  "Rabigh"),
+    ("Sipchem",                                "sipchem.com",        "Chemicals",                "Jubail"),
+    ("Advanced Petrochemical",                 "advancedpetro.com.sa","Chemicals",               "Jubail"),
+    ("Nama Chemicals",                         "namachemicals.com",  "Chemicals",                "Al Khobar"),
+    ("Arabian Pipes Company",                  "arabianpipes.com.sa","manufacturing",            "Riyadh"),
+    ("Saudi Cable Company",                    "saudicable.com.sa",  "manufacturing",            "Jeddah"),
+    ("Saudi Vitrified Clay Pipe",              "svcp.com.sa",        "manufacturing",            "Riyadh"),
+    ("Zamil Industrial",                       "zamilindustrial.com","manufacturing",            "Dammam"),
+    ("Zamil Steel",                            "zamilsteel.com",     "manufacturing",            "Dammam"),
+    ("Saudi Steel Pipes",                      "saudisteel.com.sa",  "manufacturing",            "Riyadh"),
+    ("Sabic Agri-Nutrients",                   "sabic.com",          "Chemicals",                "Riyadh"),
+    ("Saudi Pharmaceuticals",                  "spimaco.com.sa",     "healthcare",               "Riyadh"),
+    ("SPIMACO",                                "spimaco.com.sa",     "healthcare",               "Riyadh"),
+    ("Mouwasat Medical Services",              "mouwasat.com.sa",    "healthcare",               "Dammam"),
+    ("Dallah Health",                          "dallah-health.com",  "healthcare",               "Riyadh"),
+    ("Saudi German Hospital",                  "sghgroup.net",       "healthcare",               "Jeddah"),
+    ("Al Hammadi Hospital",                    "alhammadi.com.sa",   "healthcare",               "Riyadh"),
+    ("Dr. Sulaiman Al-Habib Medical",          "hmg.com.sa",         "healthcare",               "Riyadh"),
+    ("International Medical Center",           "imcjeddah.com",      "healthcare",               "Jeddah"),
+    ("Magrabi Hospitals",                      "magrabi.com.sa",     "healthcare",               "Riyadh"),
+    ("Saudi Telecom Solutions",                "solutions.com.sa",   "technology",               "Riyadh"),
+    ("Elm Company",                            "elm.sa",             "technology",               "Riyadh"),
+    ("Saudi Business Machines",                "sbm.com.sa",         "technology",               "Riyadh"),
+    ("Oracle Arabia",                          "oracle.com",         "technology",               "Riyadh"),
+    ("SAP Saudi Arabia",                       "sap.com",            "technology",               "Riyadh"),
+    ("IBM Saudi Arabia",                       "ibm.com",            "technology",               "Riyadh"),
+    ("Cisco Saudi Arabia",                     "cisco.com",          "technology",               "Riyadh"),
+    ("Huawei Saudi Arabia",                    "huawei.com",         "technology",               "Riyadh"),
+    ("Ericsson Saudi Arabia",                  "ericsson.com",       "technology",               "Riyadh"),
+    ("Accenture Saudi Arabia",                 "accenture.com",      "consulting",               "Riyadh"),
+    ("McKinsey Saudi Arabia",                  "mckinsey.com",       "consulting",               "Riyadh"),
+    ("PwC Saudi Arabia",                       "pwc.com/m1",         "consulting",               "Riyadh"),
+    ("Deloitte Saudi Arabia",                  "deloitte.com",       "consulting",               "Riyadh"),
+    ("KPMG Saudi Arabia",                      "kpmg.com/sa",        "consulting",               "Riyadh"),
+    ("Ernst & Young Saudi Arabia",             "ey.com",             "consulting",               "Riyadh"),
+    ("Parsons Saudi Arabia",                   "parsons.com",        "engineering",              "Riyadh"),
+    ("AECOM Saudi Arabia",                     "aecom.com",          "engineering",              "Riyadh"),
+    ("Jacobs Saudi Arabia",                    "jacobs.com",         "engineering",              "Riyadh"),
+    ("Wood Saudi Arabia",                      "woodplc.com",        "engineering",              "Al Khobar"),
+    ("Halliburton Saudi Arabia",               "halliburton.com",    "oil gas",                  "Al Khobar"),
+    ("Schlumberger Saudi Arabia",              "slb.com",            "oil gas",                  "Al Khobar"),
+    ("Baker Hughes Saudi Arabia",              "bakerhughes.com",    "oil gas",                  "Al Khobar"),
+    ("Saudi Oger",                             "saudioger.com",      "construction",             "Riyadh"),
+    ("Consolidated Contractors Company",       "ccc.gr",             "construction",             "Riyadh"),
+    ("Descon Engineering",                     "descon.com",         "engineering",              "Al Khobar"),
+    ("Al Qahtani",                             "alqahtani.com.sa",   "manufacturing",            "Dammam"),
+    ("Aldrees Petroleum",                      "aldrees.com",        "oil gas",                  "Riyadh"),
+    ("Arabian Gulf Cement",                    "agcc.com.sa",        "manufacturing",            "Jeddah"),
+    ("National Industrialization Company",     "tasnee.com",         "manufacturing",            "Riyadh"),
+    ("Saudi Ceramics",                         "saudiceramic.com.sa","manufacturing",            "Riyadh"),
+    ("United Wire Factories",                  "uwf.com.sa",         "manufacturing",            "Riyadh"),
+    ("Abdul Latif Jameel Motors",              "alj.com",            "automotive",               "Jeddah"),
+    ("Al Jomaih Group",                        "aljomaih.com",       "automotive",               "Riyadh"),
+    ("Saco",                                   "saco.com.sa",        "retail",                   "Riyadh"),
+    ("Extra Stores",                           "extra.com.sa",       "retail",                   "Riyadh"),
+    ("BinDawood Holding",                      "bindawood.com",      "retail",                   "Jeddah"),
+    ("Panda Retail",                           "pandaonline.com.sa", "retail",                   "Riyadh"),
+    ("Al Danube Home",                         "aldanubehome.com",   "retail",                   "Riyadh"),
+    ("Americana Group",                        "americanagroup.com", "retail",                   "Riyadh"),
+    ("Herfy Food Services",                    "herfy.com",          "hospitality",              "Riyadh"),
+    ("Fakieh Poultry Farms",                   "fakiehgroup.com",    "retail",                   "Jeddah"),
+    ("Saudi Ground Services",                  "sgs.com.sa",         "Logistics",                "Jeddah"),
+    ("SASO",                                   "saso.gov.sa",        "consulting",               "Riyadh"),
+    ("Tahakom Investments",                    "tahakom.com.sa",     "technology",               "Riyadh"),
+    ("United Wood Products Company",           "uwpco.com",          "manufacturing",            "Riyadh"),
+    ("Taiba Holding",                          "taiba.net",          "retail",                   "Riyadh"),
+    ("Arabian Pumps",                          "arabianpumps.com",   "manufacturing",            "Jeddah"),
+    ("National Gas Company",                   "ngc.com.sa",         "oil gas",                  "Dammam"),
+    ("Bupa Arabia",                            "bupa.com.sa",        "healthcare",               "Jeddah"),
+    ("Medgulf Insurance",                      "medgulf.com.sa",     "Finance & Accounting",     "Riyadh"),
+    ("Tawuniya Insurance",                     "tawuniya.com.sa",    "Finance & Accounting",     "Riyadh"),
+    ("Al Sagr Insurance",                      "alsagr.com.sa",      "Finance & Accounting",     "Riyadh"),
+    ("Walaa Insurance",                        "walaa.com.sa",       "Finance & Accounting",     "Riyadh"),
+    ("AXA Cooperative Insurance",              "axa-cooperative.com","Finance & Accounting",     "Riyadh"),
+    ("Derayah Financial",                      "derayah.com.sa",     "Finance & Accounting",     "Riyadh"),
+    ("Jadwa Investment",                       "jadwa.com",          "Finance & Accounting",     "Riyadh"),
+    ("Riyad Capital",                          "riyadcapital.com",   "Finance & Accounting",     "Riyadh"),
+    ("NEOM",                                   "neom.com",           "construction",             "Tabuk"),
+    ("King Abdullah Economic City",            "kaec.net",           "construction",             "Jeddah"),
+    ("Diriyah Gate Authority",                 "dgda.gov.sa",        "construction",             "Riyadh"),
+    ("Saudi Vision 2030",                      "vision2030.gov.sa",  "consulting",               "Riyadh"),
+    ("Saudi Aramco Energy Ventures",           "saev.com",           "technology",               "Dhahran"),
+    ("Gerab National Enterprises",             "gerab.com",          "manufacturing",            "Dammam"),
+    ("Hana International",                     "hana.com.sa",        "Logistics",                "Riyadh"),
+]
+
+
+def _website_from_email(email_str: str) -> str:
+    """Derive best-guess website from an email address string."""
+    m = re.search(r"@([\w.\-]+\.[a-z]{2,})", email_str.lower())
+    if not m:
+        return ""
+    domain = m.group(1).lstrip(".")
+    # Skip generic email providers
+    for skip in ("gmail", "hotmail", "yahoo", "outlook", "live"):
+        if skip in domain:
+            return ""
+    return f"https://www.{domain}"
+
+
+async def _try_download_pdf_via_playwright(page) -> bytes:
+    """
+    Attempt to download the SlideShare PDF directly from the CDN.
+    SlideShare stores PDFs at: https://image.slidesharecdn.com/<id>/<file>.pdf
+    We probe the SlideShare page source for any .pdf CDN link.
+    """
+    SLIDESHARE_URL = (
+        "https://www.slideshare.net/slideshow/"
+        "533158074-saudi-arabia-companies-list-contact-pdf/282526743"
+    )
+    print("      📄  Attempting SlideShare CDN PDF download via Playwright…")
+    pdf_bytes = None
+    try:
+        await page.goto(SLIDESHARE_URL, timeout=30000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+        content = await page.content()
+        # Look for the CDN PDF link in the page source
+        cdn_matches = re.findall(
+            r'(https://[^\s"\'<>]*slidesharecdn[^\s"\'<>]*\.pdf[^\s"\'<>]*)',
+            content, re.I
+        )
+        if not cdn_matches:
+            # Try meta or JSON embed
+            cdn_matches = re.findall(
+                r'"(https://[^"]*\.pdf[^"]*)"', content, re.I
+            )
+        for cdn_url in cdn_matches[:5]:
+            print(f"      🔗  PDF CDN candidate: {cdn_url[:80]}")
+            r = simple_get(cdn_url, timeout=30)
+            if r and r.headers.get("content-type", "").startswith("application/pdf"):
+                pdf_bytes = r.content
+                print(f"      ✅  PDF downloaded: {len(pdf_bytes):,} bytes")
+                break
+    except Exception as e:
+        print(f"      ⚠️  Playwright PDF download failed: {e}")
+    return pdf_bytes
+
+
+def _parse_pdf_companies(pdf_bytes: bytes) -> list:
+    """
+    Parse the Saudi companies PDF using pdfplumber.
+    Expected column layout (from document previews):
+      Company Name | Website/Email | Sector | Country | City | Address
+    Returns list of dicts: {name, website, industry, city}
+    """
+    results = []
+    try:
+        import pdfplumber
+        import io
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            print(f"      📖  PDF has {len(pdf.pages)} pages")
+            for page_obj in pdf.pages:
+                # Try table extraction first
+                tables = page_obj.extract_tables()
+                for table in tables:
+                    for row in table:
+                        if not row or len(row) < 2:
+                            continue
+                        name    = str(row[0] or "").strip()
+                        web_raw = str(row[1] or "").strip() if len(row) > 1 else ""
+                        sector  = str(row[2] or "").strip() if len(row) > 2 else "General"
+                        country = str(row[3] or "").strip() if len(row) > 3 else ""
+                        city    = str(row[4] or "").strip() if len(row) > 4 else "Saudi Arabia"
+
+                        # Skip header rows
+                        if re.match(r"^(company|name|sector|website|email|country)", name, re.I):
+                            continue
+                        # Skip non-Saudi rows
+                        if country and "saudi" not in country.lower() and "ksa" not in country.lower():
+                            # Also allow blank country (assume Saudi)
+                            if country.strip():
+                                continue
+                        if not name or len(name) < 2:
+                            continue
+
+                        # Resolve website
+                        website = ""
+                        if web_raw:
+                            if re.match(r"https?://", web_raw, re.I) or re.match(r"www\.", web_raw, re.I):
+                                website = web_raw if web_raw.startswith("http") else "https://" + web_raw
+                            elif "@" in web_raw:
+                                website = _website_from_email(web_raw)
+                            else:
+                                # Could be bare domain
+                                website = f"https://www.{web_raw}" if "." in web_raw else ""
+
+                        if not website:
+                            continue
+
+                        # Map sector to industry
+                        industry = "General"
+                        sector_l = sector.lower()
+                        for ind in INDUSTRIES:
+                            if ind.lower() in sector_l:
+                                industry = ind
+                                break
+                        if industry == "General":
+                            # Broader sector → industry mapping
+                            sector_map = {
+                                "bank": "banking", "financ": "Finance & Accounting",
+                                "insur": "Finance & Accounting", "invest": "Finance & Accounting",
+                                "oil": "oil gas", "gas": "oil gas", "petro": "oil gas",
+                                "chemical": "Chemicals", "pharma": "healthcare",
+                                "medical": "healthcare", "hospital": "healthcare",
+                                "health": "healthcare", "construction": "construction",
+                                "real estate": "construction", "build": "construction",
+                                "telecom": "telecom", "media": "Media",
+                                "advertis": "Marketing & Communications",
+                                "transport": "Logistics", "logistic": "Logistics",
+                                "food": "retail", "retail": "retail",
+                                "hotel": "hospitality", "tourism": "hospitality",
+                                "education": "education", "school": "education",
+                                "technolog": "technology", "software": "technology",
+                                "computer": "technology", "it": "technology",
+                                "manufactur": "manufacturing", "industrial": "manufacturing",
+                                "legal": "Legal", "law": "Legal",
+                                "consumer": "retail", "goods": "retail",
+                                "energy": "energy",
+                            }
+                            for kw, mapped_ind in sector_map.items():
+                                if kw in sector_l:
+                                    industry = mapped_ind
+                                    break
+
+                        results.append({
+                            "name": name,
+                            "website": website,
+                            "industry": industry,
+                            "city": city or "Saudi Arabia",
+                        })
+
+                # Fall back to text extraction if no tables found on this page
+                if not tables:
+                    text = page_obj.extract_text() or ""
+                    for line in text.split("\n"):
+                        # Look for lines containing a website
+                        url_m = re.search(r"(www\.[^\s]+|https?://[^\s]+)", line, re.I)
+                        if not url_m:
+                            continue
+                        raw_url = url_m.group(1)
+                        website = raw_url if raw_url.startswith("http") else "https://" + raw_url
+                        # Company name = text before the URL match
+                        name = line[:url_m.start()].strip()
+                        name = re.sub(r"[|,;]+$", "", name).strip()
+                        if not name or len(name) < 3:
+                            continue
+                        domain_check = get_domain(website)
+                        if domain_check in NON_SAUDI_DOMAINS:
+                            continue
+                        results.append({
+                            "name": name,
+                            "website": website,
+                            "industry": "General",
+                            "city": "Saudi Arabia",
+                        })
+
+    except ImportError:
+        print("      ⚠️  pdfplumber not available — using seed list only")
+    except Exception as e:
+        print(f"      ⚠️  PDF parse error: {e}")
+
+    # Deduplicate by domain
+    seen_d = set()
+    deduped = []
+    for row in results:
+        d = get_domain(row["website"])
+        if d and d not in seen_d:
+            seen_d.add(d)
+            deduped.append(row)
+
+    print(f"      📊  PDF parse: {len(results)} rows → {len(deduped)} unique companies")
+    return deduped
+
+
+async def slideshare_pdf_companies(page, cp, process_fn):
+    """
+    Source 16 — SlideShare / Scribd Saudi Arabia Companies Contact PDF
+    (533158074 — 292 pages, ~5000+ company records)
+    """
+    if "slideshare_pdf" in cp.get("done_sources", []):
+        print("⏭  SlideShare PDF: already done")
+        return
+
+    print("\n📑  Discovery: SlideShare Saudi Arabia Companies PDF (v7 source)")
+
+    pdf_companies = []
+
+    # ── Strategy A: Download & parse the PDF ──────────────────
+    pdf_bytes = await _try_download_pdf_via_playwright(page)
+    if pdf_bytes:
+        pdf_companies = _parse_pdf_companies(pdf_bytes)
+        print(f"    ✅  PDF strategy: {len(pdf_companies)} companies parsed from PDF")
+    else:
+        print("    ⚠️  PDF download failed — switching to hardcoded seed list")
+
+    # ── Strategy B: Hardcoded seed list (guaranteed fallback) ─
+    # Always run the seed list; global domain dedup prevents double-processing
+    seed_entries = []
+    for name, web_or_domain, sector, city in PDF_SEED_COMPANIES:
+        # Normalise: if it looks like a bare domain, add scheme
+        if not web_or_domain.startswith("http"):
+            website = f"https://www.{web_or_domain}"
+        else:
+            website = web_or_domain
+        d_check = get_domain(website)
+        if d_check in NON_SAUDI_DOMAINS:
+            continue
+        seed_entries.append({
+            "name": name,
+            "website": website,
+            "industry": sector,
+            "city": city,
+        })
+
+    # Merge: PDF-parsed first, then seed (domain dedup handled in process_company)
+    combined = pdf_companies + seed_entries
+    print(f"    📋  Total to process: {len(combined)} entries "
+          f"({len(pdf_companies)} from PDF + {len(seed_entries)} from seed list)")
+
+    processed = 0
+    for entry in tqdm(combined, desc="  PDF/Seed entries"):
+        name    = entry["name"]
+        website = entry["website"]
+        industry= entry["industry"]
+
+        domain_check = get_domain(website)
+        if domain_check in NON_SAUDI_DOMAINS or domain_check in SKIP_DOMAINS:
+            continue
+
+        domain, norm_website = parse_domain(website)
+        if not domain:
+            continue
+
+        await process_fn(page, name, norm_website, industry, cp,
+                         source_tag="slideshare_pdf")
+        processed += 1
+        await asyncio.sleep(random.uniform(0.2, 0.6))
+
+    print(f"    ✅  SlideShare PDF source: {processed} companies submitted for processing")
+    cp.setdefault("done_sources", []).append("slideshare_pdf")
+    save_checkpoint(cp)
+
+
+# ══════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════
 async def main():
     global all_jobs, company_results
 
-    print("🚀  Saudi Jobs Pipeline v6 — Maximum Discovery · No Duplicates\n")
+    print("🚀  Saudi Jobs Pipeline v7 — Maximum Discovery · No Duplicates\n")
     print("   Sources: Wikipedia · Wikidata · DDG · Kompass · eArabicMarket")
     print("            Tadawul · GulfTalent · Bayt · Naukrigulf · Glassdoor")
-    print("            Indeed · MODON · SaudiExporters · Startups · Google Maps\n")
+    print("            Indeed · MODON · SaudiExporters · Startups · Google Maps")
+    print("            SlideShare PDF (533158074 · 292-page company directory)\n")
 
     cp = load_checkpoint()
 
@@ -3294,10 +3696,9 @@ async def main():
             lambda r: r.abort()
         )
 
-        # ── Discovery order: structured → broad → job-boards ──
-        # Run all — global domain set prevents any duplicate processing
-
-        # 1. Structured data (cleanest, most accurate)
+        # ── Discovery order ────────────────────────────────────
+        # 1. Structured / static data (cleanest, run first)
+        await slideshare_pdf_companies(page, cp, process_company)   # NEW v7
         await wikidata_companies(page, cp, process_company)
         await wikipedia_companies(page, cp, process_company)
         await tadawul_companies(page, cp, process_company)
@@ -3334,7 +3735,7 @@ async def main():
 
     W = 72
     print(f"\n{'═'*W}")
-    print(f"  🏁  PIPELINE COMPLETE — v6")
+    print(f"  🏁  PIPELINE COMPLETE — v7")
     print(f"{'─'*W}")
     print(f"  {'Companies discovered:':<30} {total_companies:>6,}")
     print(f"  {'  with career pages:':<30} {with_careers:>6,}  ({100*with_careers//max(total_companies,1)}%)")
@@ -3403,3 +3804,4 @@ async def main():
 
 
 asyncio.run(main())
+
