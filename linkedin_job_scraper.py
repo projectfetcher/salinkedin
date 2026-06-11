@@ -67,8 +67,8 @@ JOB_LIMIT       = 0   # 0 = no cap
 OUTPUT_FILE = "jobs_output.xlsx"
 
 WP_URL      = "https://mauritius.mimusjobs.com/wp-json/wp/v2/"
-WP_USER     = ""
-WP_PASSWORD = ""
+WP_USER     = "calolina"
+WP_PASSWORD = "st8a 6mWY wqgV 0syR mB3i y5FQ"
 
 # =============================================================================
 #  KEYWORDS
@@ -76,11 +76,11 @@ WP_PASSWORD = ""
 
 SEARCH_KEYWORDS = [
     "",
-  #  "engineer", "developer", "manager", "finance", "sales", "HR",
- #   "doctor", "construction", "logistics", "operations", "customer service",
-  #  "teacher", "chef", "lawyer", "graphic designer", "production manager",
- #   "petroleum", "driver", "security", "researcher", "journalist",
- #   "banker", "retail", "renewable energy",
+    "engineer", "developer", "manager", "finance", "sales", "HR",
+    "doctor", "construction", "logistics", "operations", "customer service",
+    "teacher", "chef", "lawyer", "graphic designer", "production manager",
+    "petroleum", "driver", "security", "researcher", "journalist",
+    "banker", "retail", "renewable energy",
 ]
 
 # =============================================================================
@@ -2112,4 +2112,4 @@ def craw():
 
 if __name__ == "__main__":
     craw()
-Done
+
