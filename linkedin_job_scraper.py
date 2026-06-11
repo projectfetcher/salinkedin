@@ -35,7 +35,7 @@ FETCH_CHAR_LIMIT = 120_000
 # LinkedIn returns 25 jobs per page via the guest API.
 # MAX_PAGES=0 means paginate until LinkedIn stops returning new jobs.
 MAX_PAGES       = 0   # 0 = unlimited
-MAX_EMPTY_PAGES = 5   # stop a query after this many consecutive zero-result pages
+MAX_EMPTY_PAGES = 10   # stop a query after this many consecutive zero-result pages
 JOB_LIMIT       = 0   # 0 = no cap; set e.g. 500 to limit total jobs written
 
 # ── Guest API ───────────────────────────────────────────────────────────────
