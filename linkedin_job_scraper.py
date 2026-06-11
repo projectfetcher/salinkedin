@@ -55,6 +55,89 @@ WP_PASSWORD = "st8a 6mWY wqgV 0syR mB3i y5FQ"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+# ANSI colours (auto-disabled if terminal doesn't support them)
+import sys
+_USE_COLOUR = sys.stdout.isatty()
+
+def _c(code, text):
+    return f"\033[{code}m{text}\033[0m" if _USE_COLOUR else text
+
+C_HEADER  = lambda t: _c("1;36",  t)   # bold cyan
+C_LABEL   = lambda t: _c("1;33",  t)   # bold yellow
+C_VALUE   = lambda t: _c("97",    t)   # bright white
+C_DIM     = lambda t: _c("2",     t)   # dim
+C_GREEN   = lambda t: _c("1;32",  t)   # bold green
+C_RED     = lambda t: _c("1;31",  t)   # bold red
+C_BLUE    = lambda t: _c("1;34",  t)   # bold blue
+C_DIVIDER = lambda: _c("2", "─" * 72)
+
+
+def print_job_verbose(job: dict, index: int, total: int):
+    """Print a full human-readable summary of a scraped job to stdout."""
+
+    desc = job.get("jobDescription", "")
+    # Show first 400 chars of description, then ellipsis
+    desc_preview = (desc[:400] + " [...]") if len(desc) > 400 else desc
+    # Indent description lines
+    desc_indented = "\n".join("   " + line for line in desc_preview.splitlines() if line.strip())
+
+    apply = job.get("application", "")
+    apply_display = apply if apply else C_DIM("— not found —")
+
+    logo = job.get("companyLogo", "")
+    logo_display = logo if logo else C_DIM("— none —")
+
+    print()
+    print(C_DIVIDER())
+    print(C_HEADER(f"  JOB {index}/{total}"))
+    print(C_DIVIDER())
+
+    # ── Core job info ─────────────────────────────────────────────────────────
+    print(f"  {C_LABEL('Title')}          : {C_VALUE(job.get('jobTitle', ''))}")
+    print(f"  {C_LABEL('Job Type')}       : {job.get('jobType', '')}")
+    print(f"  {C_LABEL('Field')}          : {job.get('jobField', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Location')}       : {job.get('jobLocation', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Seniority')}      : {job.get('jobExperience', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Qualifications')} : {job.get('jobQualifications', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Salary')}         : {job.get('salaryRange', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Date Posted')}    : {job.get('datePosted', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Deadline')}       : {job.get('deadline', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Est. Deadline')}  : {job.get('estimatedDeadline', '') or C_DIM('—')}")
+
+    # ── Application ───────────────────────────────────────────────────────────
+    print(f"  {C_LABEL('Apply Link')}     : {C_GREEN(apply) if apply else apply_display}")
+
+    # ── Company ───────────────────────────────────────────────────────────────
+    print()
+    print(f"  {C_BLUE('── COMPANY ──────────────────────────────────────────────')}")
+    print(f"  {C_LABEL('Name')}           : {C_VALUE(job.get('companyName', '') or C_DIM('—'))}")
+    print(f"  {C_LABEL('Industry')}       : {job.get('companyIndustry', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Type')}           : {job.get('companyType', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Founded')}        : {job.get('companyFounded', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Headquarters')}   : {job.get('companyAddress', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Website')}        : {job.get('companyWebsite', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('LinkedIn URL')}   : {job.get('companyUrl', '') or C_DIM('—')}")
+    print(f"  {C_LABEL('Logo')}           : {logo_display}")
+
+    # ── Company about ─────────────────────────────────────────────────────────
+    about = job.get("companyDetails", "")
+    if about:
+        about_preview = (about[:200] + " [...]") if len(about) > 200 else about
+        print(f"  {C_LABEL('About')}          : {about_preview}")
+
+    # ── Description preview ───────────────────────────────────────────────────
+    print()
+    print(f"  {C_BLUE('── DESCRIPTION PREVIEW ──────────────────────────────────')}")
+    if desc_indented:
+        print(desc_indented)
+    else:
+        print(C_DIM("   — no description —"))
+
+    # ── Raw URL ───────────────────────────────────────────────────────────────
+    print()
+    print(f"  {C_LABEL('Job URL')}        : {C_DIM(job.get('jobUrl', ''))}")
+    print(C_DIVIDER())
+
 # =============================================================================
 #  SKIP-CRAWL DOMAINS
 # =============================================================================
@@ -1221,16 +1304,52 @@ def craw():
 
     jobs, errors = [], 0
     for j, url in enumerate(result):
-        log.info(f"Job {j+1}/{len(result)}")
+        print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(result)} ...')}")
+        log.info(f"URL: {url}")
         try:
             job = scrape_job_details(url)
             if job and job.get("jobTitle"):
                 jobs.append(job)
+                print_job_verbose(job, j + 1, len(result))
+            else:
+                print(C_RED(f"  ✗  No title found — skipped"))
         except Exception as e:
             errors += 1
+            print(C_RED(f"  ✗  ERROR: {e}"))
             log.warning(f"Job error: {e}")
         time.sleep(DELAY_S)
 
+    # ── Final summary banner ──────────────────────────────────────────────────
+    mins = round((time.time() - start_time) / 60, 1)
+    print()
+    print(C_HEADER("=" * 72))
+    print(C_HEADER("  SCRAPE COMPLETE"))
+    print(C_HEADER("=" * 72))
+    print(f"  {C_LABEL('Total scraped')}  : {C_GREEN(str(len(jobs)))} jobs")
+    print(f"  {C_LABEL('Errors')}         : {C_RED(str(errors)) if errors else '0'}")
+    print(f"  {C_LABEL('Duration')}       : ~{mins} min")
+    print(f"  {C_LABEL('Output file')}    : {OUTPUT_FILE}")
+
+    # ── Field breakdown ───────────────────────────────────────────────────────
+    if jobs:
+        from collections import Counter
+        fields = Counter(j.get("jobField") or "Unknown" for j in jobs)
+        print(f"\n  {C_LABEL('Jobs by field:')}")
+        for field, count in fields.most_common():
+            bar = "█" * count
+            print(f"    {field:<35} {C_GREEN(bar)} {count}")
+
+        # ── Apply method breakdown ────────────────────────────────────────────
+        with_apply = sum(1 for j in jobs if j.get("application"))
+        with_email = sum(1 for j in jobs if "@" in (j.get("application") or ""))
+        with_url   = with_apply - with_email
+        no_apply   = len(jobs) - with_apply
+        print(f"\n  {C_LABEL('Application links:')}")
+        print(f"    URL found    : {with_url}")
+        print(f"    Email found  : {with_email}")
+        print(f"    Not found    : {no_apply}")
+
+    print(C_HEADER("=" * 72))
     log.info(f"Scraped {len(jobs)} jobs, {errors} errors")
 
     # ── Write to Excel ────────────────────────────────────────────────────────
@@ -1259,7 +1378,6 @@ def craw():
         ])
 
     wb.save(OUTPUT_FILE)
-    mins = round((time.time() - start_time) / 60, 1)
     log.info(f"Written {len(jobs)} rows to {OUTPUT_FILE}")
     log.info(f"DONE in ~{mins} min")
 
