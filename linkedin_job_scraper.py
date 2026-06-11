@@ -69,15 +69,15 @@ PROCESSED_IDS_FILE  = "processed_jobs.csv"
 
 # ── WordPress ────────────────────────────────────────────────────────────────
 WP_URL      = "https://mauritius.mimusjobs.com/wp-json/wp/v2/"
-WP_USER     = "calolina"
-WP_PASSWORD = "st8a 6mWY wqgV 0syR mB3i y5FQ"
+WP_USER     = ""
+WP_PASSWORD = ""
 WP_BASE     = WP_URL.rstrip("/")
 WP_JOBS_URL    = f"{WP_BASE}/job_listing"
 WP_COMPANY_URL = f"{WP_BASE}/company"
 WP_MEDIA_URL   = f"{WP_BASE}/media"
 
 # ── Mistral ───────────────────────────────────────────────────────────────────
-MISTRAL_API_KEY = "your_mistral_api_key_here"   # ← replace
+MISTRAL_API_KEY = "v5eGIFf8H07IaIBbKHXkBfKfHXklR2eP"   # ← replace
 MISTRAL_MODEL   = "mistral-small-latest"
 MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 
