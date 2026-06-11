@@ -1519,8 +1519,9 @@ def craw():
     print(C_HEADER("=" * 72))
     log.info("SCRAPE STARTED")
 
-    seen_urls     = set()   # canonical dedup set — shared across ALL keywords
+    seen_urls     = set()   # canonical URL dedup — shared across ALL keywords
     all_job_urls  = []      # canonical job URLs to scrape
+    seen_content  = set()   # content fingerprint dedup — catches reposts with different IDs
 
     # ── Phase 1 : Collect all job URLs across all keywords ───────────────────
     for qi, keyword in enumerate(SEARCH_KEYWORDS):
@@ -1555,8 +1556,20 @@ def craw():
         try:
             job = scrape_job_details(url)
             if job and job.get("jobTitle"):
-                jobs.append(job)
-                print_job_verbose(job, j + 1, len(all_job_urls))
+                fp = (
+                    (job.get("jobTitle") or "").lower().strip(),
+                    (job.get("companyName") or "").lower().strip(),
+                    (job.get("jobLocation") or "").lower().strip(),
+                )
+                if fp in seen_content:
+                    title_str = job["jobTitle"]
+                    co_str = job.get("companyName", "")
+                    print(C_DIM(f"  ⧳  Duplicate content — skipped ({title_str} @ {co_str})"))
+                    log.info(f"Content duplicate skipped: {fp}")
+                else:
+                    seen_content.add(fp)
+                    jobs.append(job)
+                    print_job_verbose(job, j + 1, len(all_job_urls))
             else:
                 print(C_RED("  ✗  No title found — skipped"))
         except Exception as e:
