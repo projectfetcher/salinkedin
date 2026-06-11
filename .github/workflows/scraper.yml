@@ -1,0 +1,37 @@
+name: LinkedIn Job Scraper
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # every 2 hours (same as the Apps Script trigger)
+  workflow_dispatch:          # also allow manual runs from the Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          WP_URL:      ${{ secrets.WP_URL }}
+          WP_USER:     ${{ secrets.WP_USER }}
+          WP_PASSWORD: ${{ secrets.WP_PASSWORD }}
+        run: python linkedin_job_scraper.py
+
+      - name: Upload Excel output as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jobs-output-${{ github.run_id }}
+          path: jobs_output.xlsx
+          retention-days: 7
