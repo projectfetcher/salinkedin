@@ -1,5 +1,5 @@
 """
-LinkedIn Job Scraper — Python v1
+LinkedIn Job Scraper — Python v2
 Converted from Google Apps Script v5
 
 Requirements:
@@ -31,61 +31,60 @@ SHEET_NAME  = "Sheet1"
 DELAY_S     = 2.0        # seconds between requests (keep polite)
 FETCH_CHAR_LIMIT = 120_000
 
-# ── Pagination ────────────────────────────────────────────────────────────────
-# LinkedIn returns 25 jobs per page. Set MAX_PAGES=0 to paginate until
-# LinkedIn stops returning new jobs (no hard cap).
-MAX_PAGES       = 0   # 0 = unlimited — paginate every query until dry
-MAX_EMPTY_PAGES = 3   # stop a query after this many consecutive zero-result pages
+# ── Pagination ─────────────────────────────────────────────────────────────
+# LinkedIn returns 25 jobs per page via the guest API.
+# MAX_PAGES=0 means paginate until LinkedIn stops returning new jobs.
+MAX_PAGES       = 0   # 0 = unlimited
+MAX_EMPTY_PAGES = 5   # stop a query after this many consecutive zero-result pages
 JOB_LIMIT       = 0   # 0 = no cap; set e.g. 500 to limit total jobs written
 
-# ── Search queries ────────────────────────────────────────────────────────────
-# LinkedIn caps each query at ~1000 results. We run multiple keyword queries
-# so we can discover far more unique jobs across Saudi Arabia.
+# ── Guest API ───────────────────────────────────────────────────────────────
+# LinkedIn's guest API returns raw HTML card fragments — much more stable than
+# the main search page and bypasses most anti-bot gating.
 # f_TPR=r604800 = posted in the last 7 days (remove to get all-time).
-_BASE = "https://www.linkedin.com/jobs/search?location=Saudi+Arabia&f_TPR=r604800"
-SEARCH_QUERIES = [
-    _BASE + "&keywords=&start=",
-    _BASE + "&keywords=engineer&start=",
-    _BASE + "&keywords=manager&start=",
-    _BASE + "&keywords=analyst&start=",
-    _BASE + "&keywords=developer&start=",
-    _BASE + "&keywords=accountant&start=",
-    _BASE + "&keywords=sales&start=",
-    _BASE + "&keywords=marketing&start=",
-    _BASE + "&keywords=HR&start=",
-    _BASE + "&keywords=nurse&start=",
-    _BASE + "&keywords=doctor&start=",
-    _BASE + "&keywords=driver&start=",
-    _BASE + "&keywords=teacher&start=",
-    _BASE + "&keywords=finance&start=",
-    _BASE + "&keywords=logistics&start=",
-    _BASE + "&keywords=construction&start=",
-    _BASE + "&keywords=procurement&start=",
-    _BASE + "&keywords=operations&start=",
-    _BASE + "&keywords=customer+service&start=",
-    _BASE + "&keywords=IT&start=",
-    _BASE + "&keywords=project+manager&start=",
-    _BASE + "&keywords=civil+engineer&start=",
-    _BASE + "&keywords=mechanical+engineer&start=",
-    _BASE + "&keywords=electrical+engineer&start=",
-    _BASE + "&keywords=data+scientist&start=",
-    _BASE + "&keywords=supply+chain&start=",
-    _BASE + "&keywords=security&start=",
-    _BASE + "&keywords=receptionist&start=",
-    _BASE + "&keywords=chef&start=",
-    _BASE + "&keywords=pharmacist&start=",
-]
-
-# LinkedIn guest API endpoint — returns raw HTML cards, more stable than the
-# main search page and bypasses some anti-bot blocks.
-LI_GUEST_API = (
+_GUEST_BASE = (
     "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-    "?location=Saudi+Arabia&f_TPR=r604800&keywords={kw}&start={start}"
+    "?location=Saudi+Arabia&f_TPR=r604800"
 )
+
+# Each entry is a dict with 'kw' (keyword string) and optionally 'geoId'.
+# Saudi Arabia geoId = 101004  (use to reinforce location filtering)
+SEARCH_KEYWORDS = [
+    "",              # broad / no keyword → catches everything LinkedIn returns
+    "engineer",
+    "manager",
+    "analyst",
+    "developer",
+    "accountant",
+    "sales",
+    "marketing",
+    "HR",
+    "nurse",
+    "doctor",
+    "driver",
+    "teacher",
+    "finance",
+    "logistics",
+    "construction",
+    "procurement",
+    "operations",
+    "customer service",
+    "IT",
+    "project manager",
+    "civil engineer",
+    "mechanical engineer",
+    "electrical engineer",
+    "data scientist",
+    "supply chain",
+    "security",
+    "receptionist",
+    "chef",
+    "pharmacist",
+]
 
 OUTPUT_FILE = "jobs_output.xlsx"
 
-# ── Rotating User-Agents ──────────────────────────────────────────────────────
+# ── Rotating User-Agents ────────────────────────────────────────────────────
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -105,6 +104,9 @@ def _next_headers() -> dict:
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Cache-Control": "no-cache",
+        # Guest API expects these extra headers
+        "X-Li-Lang": "en_US",
+        "X-Requested-With": "XMLHttpRequest",
     }
 
 HEADERS = _next_headers()   # default headers for code that references HEADERS directly
@@ -117,30 +119,25 @@ WP_PASSWORD = "st8a 6mWY wqgV 0syR mB3i y5FQ"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ANSI colours (auto-disabled if terminal doesn't support them)
 import sys
 _USE_COLOUR = sys.stdout.isatty()
 
 def _c(code, text):
     return f"\033[{code}m{text}\033[0m" if _USE_COLOUR else text
 
-C_HEADER  = lambda t: _c("1;36",  t)   # bold cyan
-C_LABEL   = lambda t: _c("1;33",  t)   # bold yellow
-C_VALUE   = lambda t: _c("97",    t)   # bright white
-C_DIM     = lambda t: _c("2",     t)   # dim
-C_GREEN   = lambda t: _c("1;32",  t)   # bold green
-C_RED     = lambda t: _c("1;31",  t)   # bold red
-C_BLUE    = lambda t: _c("1;34",  t)   # bold blue
+C_HEADER  = lambda t: _c("1;36",  t)
+C_LABEL   = lambda t: _c("1;33",  t)
+C_VALUE   = lambda t: _c("97",    t)
+C_DIM     = lambda t: _c("2",     t)
+C_GREEN   = lambda t: _c("1;32",  t)
+C_RED     = lambda t: _c("1;31",  t)
+C_BLUE    = lambda t: _c("1;34",  t)
 C_DIVIDER = lambda: _c("2", "─" * 72)
 
 
 def print_job_verbose(job: dict, index: int, total: int):
-    """Print a full human-readable summary of a scraped job to stdout."""
-
     desc = job.get("jobDescription", "")
-    # Show first 400 chars of description, then ellipsis
     desc_preview = (desc[:400] + " [...]") if len(desc) > 400 else desc
-    # Indent description lines
     desc_indented = "\n".join("   " + line for line in desc_preview.splitlines() if line.strip())
 
     apply = job.get("application", "")
@@ -153,8 +150,6 @@ def print_job_verbose(job: dict, index: int, total: int):
     print(C_DIVIDER())
     print(C_HEADER(f"  JOB {index}/{total}"))
     print(C_DIVIDER())
-
-    # ── Core job info ─────────────────────────────────────────────────────────
     print(f"  {C_LABEL('Title')}          : {C_VALUE(job.get('jobTitle', ''))}")
     print(f"  {C_LABEL('Job Type')}       : {job.get('jobType', '')}")
     print(f"  {C_LABEL('Field')}          : {job.get('jobField', '') or C_DIM('—')}")
@@ -165,11 +160,7 @@ def print_job_verbose(job: dict, index: int, total: int):
     print(f"  {C_LABEL('Date Posted')}    : {job.get('datePosted', '') or C_DIM('—')}")
     print(f"  {C_LABEL('Deadline')}       : {job.get('deadline', '') or C_DIM('—')}")
     print(f"  {C_LABEL('Est. Deadline')}  : {job.get('estimatedDeadline', '') or C_DIM('—')}")
-
-    # ── Application ───────────────────────────────────────────────────────────
     print(f"  {C_LABEL('Apply Link')}     : {C_GREEN(apply) if apply else apply_display}")
-
-    # ── Company ───────────────────────────────────────────────────────────────
     print()
     print(f"  {C_BLUE('── COMPANY ──────────────────────────────────────────────')}")
     print(f"  {C_LABEL('Name')}           : {C_VALUE(job.get('companyName', '') or C_DIM('—'))}")
@@ -180,22 +171,16 @@ def print_job_verbose(job: dict, index: int, total: int):
     print(f"  {C_LABEL('Website')}        : {job.get('companyWebsite', '') or C_DIM('—')}")
     print(f"  {C_LABEL('LinkedIn URL')}   : {job.get('companyUrl', '') or C_DIM('—')}")
     print(f"  {C_LABEL('Logo')}           : {logo_display}")
-
-    # ── Company about ─────────────────────────────────────────────────────────
     about = job.get("companyDetails", "")
     if about:
         about_preview = (about[:200] + " [...]") if len(about) > 200 else about
         print(f"  {C_LABEL('About')}          : {about_preview}")
-
-    # ── Description preview ───────────────────────────────────────────────────
     print()
     print(f"  {C_BLUE('── DESCRIPTION PREVIEW ──────────────────────────────────')}")
     if desc_indented:
         print(desc_indented)
     else:
         print(C_DIM("   — no description —"))
-
-    # ── Raw URL ───────────────────────────────────────────────────────────────
     print()
     print(f"  {C_LABEL('Job URL')}        : {C_DIM(job.get('jobUrl', ''))}")
     print(C_DIVIDER())
@@ -291,6 +276,18 @@ def decode_html_entities(s: str) -> str:
     for old, new in replacements:
         s = s.replace(old, new)
     return s
+
+
+def canonicalise_job_url(url: str) -> str:
+    """Strip query string and fragment, normalise to the /jobs/view/NNN/ path."""
+    if not url:
+        return ""
+    # Extract the view ID so we can rebuild a clean URL
+    m = re.search(r"/jobs/view/(\d+)", url)
+    if m:
+        return f"https://www.linkedin.com/jobs/view/{m.group(1)}/"
+    # Fallback: strip everything after ?
+    return re.sub(r"[?#].*$", "", url)
 
 # =============================================================================
 #  HTTP
@@ -552,7 +549,6 @@ def estimate_deadline_from_posted(posted_text: str) -> str:
             year  = base.year + month // 12
             month = month % 12 or 12
             base  = base.replace(year=year, month=month)
-    # Add 3 months for estimated close
     month = base.month + 3
     year  = base.year + (month - 1) // 12
     month = (month - 1) % 12 + 1
@@ -863,12 +859,8 @@ def decode_linkedin_apply_url(raw: str) -> str:
 # =============================================================================
 
 def follow_linkedin_apply_button(soup: BeautifulSoup, job_url: str) -> str:
-    selectors = [
-        {"attrs": {"data-tracking-control-name": re.compile(r"apply.link.offsite", re.I)}},
-    ]
     raw = ""
 
-    # Try common apply link patterns
     for tag in soup.find_all("a", href=True):
         href = tag.get("href", "")
         control = tag.get("data-tracking-control-name", "")
@@ -1033,7 +1025,6 @@ def extract_application_details(job_url: str, soup: BeautifulSoup, company_websi
         log.info(f"S0 apply button: {apply_btn}")
         return {"url": apply_btn, "email": "", "method": "s0_apply_button"}
 
-    # Script tag search
     apply_from_script = ""
     for script in soup.find_all("script"):
         if apply_from_script:
@@ -1052,7 +1043,6 @@ def extract_application_details(job_url: str, soup: BeautifulSoup, company_websi
     if apply_from_script:
         return {"url": apply_from_script, "email": "", "method": "s1b_script_tag"}
 
-    # Description links
     desc_el = soup.select_one(".show-more-less-html__markup") or soup.select_one(".description__text")
     if desc_el:
         for a in desc_el.find_all("a", href=True):
@@ -1281,7 +1271,7 @@ def scrape_job_details(job_url: str) -> dict | None:
     if not salary:
         for chip in soup.select(".job-details-jobs-unified-top-card__job-insight"):
             t = chip.get_text(strip=True)
-            if re.search(r"\$|MUR|Rs\.?|salary|/yr|/hour|per month", t, re.I):
+            if re.search(r"\$|MUR|Rs\.?|SAR|salary|/yr|/hour|per month", t, re.I):
                 salary = t
                 break
 
@@ -1340,76 +1330,133 @@ def scrape_job_details(job_url: str) -> dict | None:
     }
 
 # =============================================================================
-#  MAIN CRAWL
+#  URL COLLECTION — GUEST API  (primary method)
 # =============================================================================
 
-def _collect_job_urls_from_page(html: str, seen: set) -> list:
+def _build_guest_api_url(keyword: str, start: int) -> str:
     """
-    Extract all job URLs from a LinkedIn search result page (HTML or API fragment).
-    Tries every known selector LinkedIn has used across different layouts.
-    Returns list of new (unseen) canonical job URLs.
+    Build a LinkedIn guest-API URL for a given keyword and pagination offset.
+    The guest API returns raw HTML card fragments (no JavaScript needed) and
+    is far more scraper-friendly than the main search page.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    from urllib.parse import quote_plus
+    kw_encoded = quote_plus(keyword)
+    return (
+        f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        f"?location=Saudi+Arabia&f_TPR=r604800&keywords={kw_encoded}&start={start}"
+    )
+
+
+def _collect_job_urls_from_cards(html: str, seen: set) -> list[str]:
+    """
+    Extract job URLs from a LinkedIn guest-API card fragment or a full search page.
+
+    The guest API returns a list of raw <li> elements — NOT a full HTML document.
+    BeautifulSoup handles this fine, but CSS class selectors that rely on nested
+    document structure (e.g. '.base-card__full-link') often fail on fragments.
+    So we use a multi-strategy approach:
+
+    1. Regex on raw HTML — fastest, works even if BS4 parsing is imperfect.
+    2. BS4 href attribute scan — catches any <a> whose href contains /jobs/view/.
+    3. BS4 CSS selectors — fallback for full pages (e.g. main search page HTML).
+    """
     found = []
 
-    # All known link selectors across LinkedIn layouts
-    selectors = [
+    # ── Strategy 1: regex on raw HTML (most reliable for card fragments) ──────
+    for raw_href in re.findall(r'href="(https?://[^"]*?/jobs/view/\d+[^"]*?)"', html):
+        canonical = canonicalise_job_url(raw_href)
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            found.append(canonical)
+
+    # ── Strategy 2: BS4 href attribute scan ───────────────────────────────────
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]
+        if "/jobs/view/" not in href:
+            continue
+        if not href.startswith("http"):
+            href = "https://www.linkedin.com" + href
+        canonical = canonicalise_job_url(href)
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            found.append(canonical)
+
+    # ── Strategy 3: CSS selectors (full-page fallback) ────────────────────────
+    css_selectors = [
         "a.base-card__full-link",
         "a.base-main-card__full-link",
         "a[data-tracking-control-name='public_jobs_jserp-name_click']",
-        "a[href*='/jobs/view/']",
         "a.job-card-list__title",
         "a.job-card-container__link",
     ]
-
-    for sel in selectors:
+    for sel in css_selectors:
         for tag in soup.select(sel):
             href = tag.get("href", "")
-            if not href or "/jobs/view/" not in href:
+            if "/jobs/view/" not in href:
                 continue
-            # Canonicalise: strip query string, keep just the view URL
-            canonical = re.sub(r"\?.*$", "", href.split("?")[0])
-            if canonical not in seen:
+            if not href.startswith("http"):
+                href = "https://www.linkedin.com" + href
+            canonical = canonicalise_job_url(href)
+            if canonical and canonical not in seen:
                 seen.add(canonical)
-                found.append(href)   # keep original href (may have tracking params)
+                found.append(canonical)
 
     return found
 
 
-def _fetch_search_page(base_url: str, start: int, retries: int = 3) -> str | None:
-    """Fetch one page of LinkedIn search results with retry + back-off."""
-    url = base_url + str(start)
+def _fetch_guest_api_page(keyword: str, start: int, retries: int = 3) -> str | None:
+    """Fetch one page of LinkedIn guest API results with retry + back-off."""
+    url = _build_guest_api_url(keyword, start)
     for attempt in range(retries):
         try:
             time.sleep(DELAY_S + attempt * 3)
             r = requests.get(url, headers=_next_headers(), allow_redirects=True, timeout=25)
+
             if r.status_code == 429:
                 wait = 60 + attempt * 60
-                print(C_RED(f"  ⏳ Rate limited (429) on list page — waiting {wait}s ..."))
-                log.warning(f"429 on {url} — sleeping {wait}s")
+                print(C_RED(f"  ⏳ Rate limited (429) — waiting {wait}s ..."))
+                log.warning(f"429 on guest API start={start} kw='{keyword}' — sleeping {wait}s")
                 time.sleep(wait)
                 continue
-            if r.status_code in (403, 999):
-                log.warning(f"Blocked ({r.status_code}) on list page: {url}")
+
+            if r.status_code in (400, 403, 999):
+                log.warning(f"Blocked ({r.status_code}) on guest API: {url}")
                 return None
+
             if r.status_code != 200:
-                log.warning(f"HTTP {r.status_code} on list page: {url}")
+                log.warning(f"HTTP {r.status_code} on guest API: {url}")
                 return None
-            return r.text
+
+            text = r.text.strip()
+
+            # LinkedIn returns an empty body (or whitespace) when there are no
+            # more results for this offset — treat that as a clean stop signal.
+            if not text:
+                log.info(f"Empty body from guest API (start={start}, kw='{keyword}') — end of results.")
+                return None
+
+            return text
+
         except Exception as e:
-            log.warning(f"List page fetch error (attempt {attempt+1}): {e}")
+            log.warning(f"Guest API fetch error (attempt {attempt+1}, kw='{keyword}', start={start}): {e}")
             time.sleep(3 + attempt * 3)
+
     return None
 
 
-def _paginate_query(base_url: str, label: str, seen: set) -> list:
+def _paginate_keyword(keyword: str, seen: set) -> list[str]:
     """
-    Paginate a single search query until LinkedIn returns no new results.
-    Returns list of job URLs found.
+    Paginate the guest API for a single keyword until LinkedIn returns no new
+    results or hits the 1 000-result cap (start >= 975).
+
+    Returns a list of canonical job URLs not previously in `seen`.
     """
-    urls   = []
-    page   = 0
+    urls         = []
+    page         = 0
     empty_streak = 0
+
+    label = keyword if keyword else "(all)"
 
     while True:
         if MAX_PAGES and page >= MAX_PAGES:
@@ -1418,25 +1465,23 @@ def _paginate_query(base_url: str, label: str, seen: set) -> list:
 
         start = page * 25
         print(f"  {C_DIM(f'[{label}] page {page+1} (start={start}) ...')}", flush=True)
-        html = _fetch_search_page(base_url, start)
 
-        if not html:
-            empty_streak += 1
-            log.warning(f"[{label}] No HTML on page {page+1} (streak={empty_streak})")
-            if empty_streak >= MAX_EMPTY_PAGES:
-                break
-            page += 1
-            continue
+        html = _fetch_guest_api_page(keyword, start)
 
-        new_urls = _collect_job_urls_from_page(html, seen)
-        log.info(f"[{label}] page {page+1}: {len(new_urls)} new URLs (total seen={len(seen)})")
+        if html is None:
+            # Empty body = LinkedIn signalled end of results; treat as clean stop
+            log.info(f"[{label}] No results at start={start} — query exhausted.")
+            break
+
+        new_urls = _collect_job_urls_from_cards(html, seen)
+        log.info(f"[{label}] page {page+1}: {len(new_urls)} new URLs (seen total={len(seen)})")
 
         if new_urls:
             urls.extend(new_urls)
             empty_streak = 0
         else:
             empty_streak += 1
-            log.info(f"[{label}] Zero new URLs (streak={empty_streak})")
+            log.info(f"[{label}] Zero new URLs (streak={empty_streak}/{MAX_EMPTY_PAGES})")
             if empty_streak >= MAX_EMPTY_PAGES:
                 log.info(f"[{label}] {MAX_EMPTY_PAGES} empty pages in a row — query exhausted.")
                 break
@@ -1447,14 +1492,19 @@ def _paginate_query(base_url: str, label: str, seen: set) -> list:
             break
 
         page += 1
-        # Longer pause every 10 pages to avoid rate-limiting
+
+        # Longer pause every 10 pages to reduce rate-limit risk
         if page % 10 == 0:
-            pause = 15
-            print(C_DIM(f"  Pausing {pause}s every 10 pages ..."))
+            pause = 20
+            print(C_DIM(f"  Pausing {pause}s (every 10 pages) ..."))
             time.sleep(pause)
 
     return urls
 
+
+# =============================================================================
+#  MAIN CRAWL
+# =============================================================================
 
 def craw():
     start_time = time.time()
@@ -1462,53 +1512,51 @@ def craw():
     print(C_HEADER("=" * 72))
     print(C_HEADER("  LINKEDIN JOB SCRAPER — Saudi Arabia"))
     print(C_HEADER("=" * 72))
-    print(f"  Queries     : {len(SEARCH_QUERIES)}")
-    print(f"  Max pages   : {'unlimited' if not MAX_PAGES else MAX_PAGES} per query")
+    print(f"  Keywords    : {len(SEARCH_KEYWORDS)}")
+    print(f"  Max pages   : {'unlimited' if not MAX_PAGES else MAX_PAGES} per keyword")
     print(f"  Job cap     : {'none' if not JOB_LIMIT else JOB_LIMIT}")
     print(f"  Started     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(C_HEADER("=" * 72))
-    log.info(f"SCRAPE STARTED")
+    log.info("SCRAPE STARTED")
 
-    seen_urls = set()   # canonical URLs (no query string) — dedup across all queries
-    all_job_hrefs = []  # original hrefs (with tracking params) for scraping
+    seen_urls     = set()   # canonical dedup set — shared across ALL keywords
+    all_job_urls  = []      # canonical job URLs to scrape
 
-    # ── Phase 1 : Collect all job URLs across all search queries ─────────────
-    for qi, base_url in enumerate(SEARCH_QUERIES):
-        # Extract keyword label from URL for display
-        kw_m  = re.search(r"keywords=([^&]*)", base_url)
-        label = kw_m.group(1).replace("+", " ") if kw_m and kw_m.group(1) else "all"
+    # ── Phase 1 : Collect all job URLs across all keywords ───────────────────
+    for qi, keyword in enumerate(SEARCH_KEYWORDS):
+        label = keyword if keyword else "(all)"
         print()
-        print(C_BLUE(f"┌─ Query {qi+1}/{len(SEARCH_QUERIES)}: keyword='{label}' ─────────────────"))
+        print(C_BLUE(f"┌─ Keyword {qi+1}/{len(SEARCH_KEYWORDS)}: '{label}' ─────────────────"))
 
-        new_hrefs = _paginate_query(base_url, label, seen_urls)
-        all_job_hrefs.extend(new_hrefs)
+        new_urls = _paginate_keyword(keyword, seen_urls)
+        all_job_urls.extend(new_urls)
 
-        print(C_BLUE(f"└─ Found {len(new_hrefs)} new jobs (running total: {len(all_job_hrefs)})"))
+        print(C_BLUE(f"└─ Found {len(new_urls)} new jobs (running total: {len(all_job_urls)})"))
 
-        if JOB_LIMIT and len(all_job_hrefs) >= JOB_LIMIT:
-            log.info(f"JOB_LIMIT={JOB_LIMIT} reached during collection — stopping queries.")
+        if JOB_LIMIT and len(all_job_urls) >= JOB_LIMIT:
+            log.info(f"JOB_LIMIT={JOB_LIMIT} reached during collection — stopping.")
             break
 
-        # Polite pause between queries
+        # Polite pause between keywords
         time.sleep(DELAY_S * 2)
 
-    if JOB_LIMIT and len(all_job_hrefs) > JOB_LIMIT:
-        all_job_hrefs = all_job_hrefs[:JOB_LIMIT]
+    if JOB_LIMIT and len(all_job_urls) > JOB_LIMIT:
+        all_job_urls = all_job_urls[:JOB_LIMIT]
 
     print()
-    print(C_HEADER(f"  Total unique job URLs collected: {len(all_job_hrefs)}"))
+    print(C_HEADER(f"  Total unique job URLs collected: {len(all_job_urls)}"))
     print()
 
     # ── Phase 2 : Scrape each job detail page ────────────────────────────────
     jobs, errors = [], 0
-    for j, url in enumerate(all_job_hrefs):
-        print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(all_job_hrefs)} ...')}")
+    for j, url in enumerate(all_job_urls):
+        print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(all_job_urls)} ...')}")
         log.info(f"URL: {url}")
         try:
             job = scrape_job_details(url)
             if job and job.get("jobTitle"):
                 jobs.append(job)
-                print_job_verbose(job, j + 1, len(all_job_hrefs))
+                print_job_verbose(job, j + 1, len(all_job_urls))
             else:
                 print(C_RED("  ✗  No title found — skipped"))
         except Exception as e:
@@ -1518,10 +1566,10 @@ def craw():
 
         time.sleep(DELAY_S)
 
-        # Save incrementally every 50 jobs so progress isn't lost on crash
+        # Incremental save every 50 jobs
         if len(jobs) % 50 == 0 and len(jobs) > 0:
             _save_excel(jobs)
-            log.info(f"Incremental save: {len(jobs)} jobs written so far.")
+            log.info(f"Incremental save: {len(jobs)} jobs written.")
 
     # ── Final save ────────────────────────────────────────────────────────────
     _save_excel(jobs)
@@ -1559,7 +1607,6 @@ def craw():
 
 
 def _save_excel(jobs: list):
-    """Write all jobs to the output Excel file (overwrites previous)."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = SHEET_NAME
