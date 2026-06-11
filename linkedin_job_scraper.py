@@ -1,56 +1,56 @@
 """
-LinkedIn Job Scraper — Python v4 + Mistral Paraphrase
-======================================================
-Fuses v4 scraper (deep company-website crawling) with the Mistral-powered
-paraphrase pipeline (title, description, company details, tagline).
+LinkedIn Job Scraper — Python v5
+Built on v4, with significantly improved company-website crawling.
 
-What's new vs plain v4:
-    ─ Mistral API integration for paraphrasing
-        • paraphrase_title()        — rewrites job title
-        • paraphrase_description()  — rewrites description paragraph-by-paragraph
-        • paraphrase_company()      — rewrites company about/details text
-        • paraphrase_tagline()      — rewrites short company tagline
-    ─ All v4 scraping layers preserved (JSON-LD, apply-button, deep crawl,
-      about/contact/footer, v3 fallback)
-    ─ Jobs are paraphrased BEFORE being written to Excel / WordPress
-    ─ Duplicate tracker (CSV) records status per job ID
-    ─ WordPress posting uses paraphrased title + description
+What changed in v5:
+    ─ crawl_company_website_deep()  — REWRITTEN
+        • Smarter careers-page discovery (link text + URL pattern + HEAD probing)
+        • Job listing matching now uses BOTH anchor text AND surrounding text context
+        • Follow redirects on apply buttons (handles ATS redirects: Greenhouse,
+          Lever, Workday, BambooHR, SmartRecruiters, Taleo, iCIMS, JazzHR …)
+        • Detects mailto: apply links at every layer
+        • Strict time-boxing (20 s total) with per-request timeouts
+        • Returns method tag so the caller knows which layer succeeded
+
+    ─ scrape_about_contact_footer()  — ENHANCED
+        • Tries /about, /about-us, /contact, /contact-us, /our-story, /team pages
+        • Parses <footer>, address schema, og:description, first <p>, phone patterns
+        • Harvests social links
+        • Hard 15 s time-box
+
+    ─ extract_application_details()  — UPDATED
+        • Calls deep crawl (step 3) before falling back to description links
+        • Passes company website AND job URL origin as hints to deep crawler
+        • If deep crawl yields email, that wins over bare URL
+        • Last resort: email from site_info gathered by scrape_about_contact_footer
+
+    ─ scrape_job_details()  — UPDATED
+        • After merging LinkedIn layers, calls scrape_about_contact_footer for
+          any still-empty company fields (address, founded, about, phone)
+        • Stores phone in companyDetails when not already present
+
+    ─ All v4 fallback behaviour preserved unchanged.
 
 Requirements:
-    pip install requests beautifulsoup4 openpyxl sentence-transformers language-tool-python
+    pip install requests beautifulsoup4 openpyxl
 
 Usage:
-    python linkedin_job_scraper_v4_paraphrase.py
+    python linkedin_job_scraper_v5.py
 
-Outputs:
-    jobs_output.xlsx          — scraped + paraphrased jobs
-    processed_jobs.csv        — duplicate / status tracker
+Output:
+    jobs_output.xlsx
 """
 
 import re
 import time
 import base64
 import json
-import hashlib
 import logging
-import os
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse, unquote, quote_plus
-
 import requests
 from bs4 import BeautifulSoup
 import openpyxl
-import pandas as pd
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  OPTIONAL heavy deps — imported lazily so the scraper still runs without them
-# ─────────────────────────────────────────────────────────────────────────────
-try:
-    import language_tool_python
-    from sentence_transformers import SentenceTransformer, util
-    _NLP_AVAILABLE = True
-except ImportError:
-    _NLP_AVAILABLE = False
 
 # =============================================================================
 #  CONFIG
@@ -64,25 +64,11 @@ MAX_PAGES       = 0   # 0 = unlimited
 MAX_EMPTY_PAGES = 5
 JOB_LIMIT       = 0   # 0 = no cap
 
-OUTPUT_FILE         = "jobs_output.xlsx"
-PROCESSED_IDS_FILE  = "processed_jobs.csv"
+OUTPUT_FILE = "jobs_output.xlsx"
 
-# ── WordPress ────────────────────────────────────────────────────────────────
 WP_URL      = "https://mauritius.mimusjobs.com/wp-json/wp/v2/"
 WP_USER     = ""
 WP_PASSWORD = ""
-WP_BASE     = WP_URL.rstrip("/")
-WP_JOBS_URL    = f"{WP_BASE}/job_listing"
-WP_COMPANY_URL = f"{WP_BASE}/company"
-WP_MEDIA_URL   = f"{WP_BASE}/media"
-
-# ── Mistral ───────────────────────────────────────────────────────────────────
-MISTRAL_API_KEY = "v5eGIFf8H07IaIBbKHXkBfKfHXklR2eP"   # ← replace
-MISTRAL_MODEL   = "mistral-small-latest"
-MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
-
-# Enable / disable paraphrasing globally
-ENABLE_PARAPHRASE = True   # set False to skip paraphrasing entirely
 
 # =============================================================================
 #  KEYWORDS
@@ -91,10 +77,10 @@ ENABLE_PARAPHRASE = True   # set False to skip paraphrasing entirely
 SEARCH_KEYWORDS = [
     "",
   #  "engineer", "developer", "manager", "finance", "sales", "HR",
-  #  "doctor", "construction", "logistics", "operations", "customer service",
+ #   "doctor", "construction", "logistics", "operations", "customer service",
   #  "teacher", "chef", "lawyer", "graphic designer", "production manager",
-  #  "petroleum", "driver", "security", "researcher", "journalist",
-  #  "banker", "retail", "renewable energy",
+ #   "petroleum", "driver", "security", "researcher", "journalist",
+ #   "banker", "retail", "renewable energy",
 ]
 
 # =============================================================================
@@ -171,6 +157,17 @@ NOISE_EMAIL_DOMAINS = [
     "schema.org","wixpress.com","squarespace.com",
 ]
 
+# Known ATS (Applicant Tracking Systems) domains — these are valid apply URLs
+ATS_DOMAINS = [
+    "greenhouse.io","lever.co","workday.com","bamboohr.com",
+    "smartrecruiters.com","taleo.net","icims.com","jazzhr.com",
+    "recruitee.com","workable.com","ashbyhq.com","breezy.hr",
+    "jobvite.com","pinpointhq.com","teamtailor.com","personio.de",
+    "comeet.com","rippling.com","gusto.com","ats.com",
+    "myworkdayjobs.com","ultipro.com","successfactors.com",
+    "oraclecloudhq.com","careers-page.com","applytojob.com",
+]
+
 FAKE_LOCAL_RE  = re.compile(
     r"^(name|user|email|mail|yourname|your[-_.]?email|sample|test|info|hello"
     r"|noreply|no[-_.]?reply|admin|webmaster|support|contact|example)$", re.I)
@@ -183,442 +180,8 @@ MONTH_MAP = {
     "jul":6,"aug":7,"sep":8,"oct":9,"nov":10,"dec":11,
 }
 
-JOB_TYPE_MAPPING = {
-    "full-time": "full-time", "full time": "full-time",
-    "part-time": "part-time", "part time": "part-time",
-    "contract":  "contract",  "temporary": "temporary",
-    "internship":"internship","freelance": "freelance",
-    "volunteer": "volunteer",
-}
-
 # =============================================================================
-#  MOJIBAKE / TEXT HELPERS
-# =============================================================================
-
-_MOJIBAKE = [
-    ("Â", ""), ("â€™", "'"), ("â€œ", '"'), ("â€\x9d", '"'), ("â€", '"'),
-    ("â€¢", "•"), ("â„¢", "™"), ("\u00a0", " "), ("\u200b", ""), ("\ufeff", ""),
-]
-
-def _fix_mojibake(text: str) -> str:
-    for pattern, replacement in _MOJIBAKE:
-        text = text.replace(pattern, replacement)
-    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
-    return text
-
-def sanitize_text(text, is_url=False, is_email=False) -> str:
-    if not isinstance(text, str):
-        text = str(text) if (text is not None and str(text) not in ("nan","None","NaN")) else ""
-    text = text.strip()
-    if text in ("nan", "None", "NaN", "", "N/A", "n/a", "NA", "na"):
-        return ""
-    text = _fix_mojibake(text)
-    if is_url or is_email:
-        return re.sub(r"[ \t\r\n\f\v]+", " ", text).strip()
-    text = re.sub(r"#+\s*", "", text)
-    text = re.sub(r"\*\*", "", text)
-    text = re.sub(r"[^\x20-\x7E\n\u00C0-\u017F\u2013\u2014\u2018-\u201D\u2022]", "", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
-
-# =============================================================================
-#  NLP TOOLS (lazy init)
-# =============================================================================
-
-_grammar_tool   = None
-_sim_model      = None
-
-def _get_grammar_tool():
-    global _grammar_tool
-    if _grammar_tool is None and _NLP_AVAILABLE:
-        try:
-            _grammar_tool = language_tool_python.LanguageTool(
-                "en-US", remote_server="https://api.languagetool.org")
-        except Exception as e:
-            log.warning(f"LanguageTool init failed: {e}")
-    return _grammar_tool
-
-def _get_sim_model():
-    global _sim_model
-    if _sim_model is None and _NLP_AVAILABLE:
-        try:
-            _sim_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-        except Exception as e:
-            log.warning(f"SentenceTransformer init failed: {e}")
-    return _sim_model
-
-def grammar_correct(text: str) -> str:
-    tool = _get_grammar_tool()
-    if tool:
-        try:
-            return language_tool_python.utils.correct(text, tool.check(text))
-        except Exception:
-            pass
-    return text
-
-def similarity_score(a: str, b: str) -> float:
-    model = _get_sim_model()
-    if model:
-        try:
-            from sentence_transformers import util as st_util
-            emb = model.encode([a, b], convert_to_tensor=True)
-            return float(st_util.pytorch_cos_sim(emb[0], emb[1]))
-        except Exception:
-            pass
-    # Fallback: simple token overlap
-    def tokens(s):
-        return set(re.sub(r"[^a-z0-9 ]", " ", s.lower()).split())
-    ta, tb = tokens(a), tokens(b)
-    if not ta or not tb: return 0.0
-    return len(ta & tb) / max(len(ta), len(tb))
-
-def clean_output(text: str) -> str:
-    text = _fix_mojibake(text)
-    for pat in [r"\[/?INST\]", r"</?s>",
-                r"(?i)(rewritten?|rephrased?|output|paraphrase[d]?)[:\s]+",
-                r"\*\*", r"###", r"---"]:
-        text = re.sub(pat, "", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return grammar_correct(text.strip())
-
-# =============================================================================
-#  MISTRAL API
-# =============================================================================
-
-def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
-    if not MISTRAL_API_KEY or MISTRAL_API_KEY == "your_mistral_api_key_here":
-        log.warning("Mistral API key not set — skipping paraphrase")
-        return ""
-    try:
-        response = requests.post(
-            MISTRAL_URL,
-            headers={
-                "Authorization": f"Bearer {MISTRAL_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": MISTRAL_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        log.error(f"Mistral API error: {e}")
-        return ""
-
-# =============================================================================
-#  PARAPHRASE FUNCTIONS
-# =============================================================================
-
-def paraphrase_title(title: str) -> str:
-    if not ENABLE_PARAPHRASE:
-        return title
-    clean = sanitize_text(title)
-    if not clean:
-        return title
-
-    print(f"\n ┌─ TITLE PARAPHRASE {'─'*45}")
-    print(f" │ Original : \"{clean}\"")
-    print(f" │ {'─'*60}")
-
-    best_result = None
-    best_sim = 0.0
-
-    for attempt in range(4):
-        temp = round(0.68 + attempt * 0.06, 2)
-        print(f" │ Attempt {attempt+1} (temp={temp}):")
-
-        prompt = (
-            f"Rewrite this job title professionally using different words. "
-            f"Output ONLY the rewritten title, nothing else. "
-            f"Keep it between 4 and 12 words.\n\nJob title: {clean}"
-        )
-
-        raw = mistral_generate(prompt, max_tokens=50, temperature=temp)
-        result = clean_output(raw).split("\n")[0].strip().strip('"').strip("'")
-
-        wc = len(result.split()) if result else 0
-        sim = similarity_score(clean, result) if result else 0.0
-        is_dup = result.lower().strip() == clean.lower().strip()
-
-        print(f" │    Output  : \"{result}\"")
-        print(f" │    Words   : {wc} | Similarity: {sim:.3f} | Duplicate: {'Yes ⚠️' if is_dup else 'No'}")
-
-        valid = bool(result) and 4 <= wc <= 14 and sim >= 0.55 and not is_dup
-
-        if not valid:
-            reasons = []
-            if not result:           reasons.append("empty output")
-            if wc < 4:               reasons.append(f"too short ({wc} words, min=4)")
-            if wc > 14:              reasons.append(f"too long ({wc} words, max=14)")
-            if sim < 0.55:           reasons.append(f"sim={sim:.3f} < 0.55")
-            if is_dup:               reasons.append("identical to original")
-            print(f" │    → ❌ REJECTED — {', '.join(reasons)}")
-        else:
-            if sim > best_sim:
-                best_sim = sim
-                best_result = result
-                print(f" │    → ✅ ACCEPTED — new best candidate (sim={sim:.3f})")
-            else:
-                print(f" │    → ✅ VALID but not better than current best (best sim={best_sim:.3f})")
-
-        print(f" │ {'─'*60}")
-        time.sleep(1)
-
-    if best_result:
-        print(f" │ 🏆 FINAL SELECTED : \"{best_result}\"")
-        print(f" │    Similarity     : {best_sim:.3f}")
-        print(f" └{'─'*65}")
-        return best_result
-    else:
-        print(f" │ ⚠️  No valid paraphrase found → Keeping original: \"{clean}\"")
-        print(f" └{'─'*65}")
-        return clean
-
-
-def paraphrase_description(text: str) -> str:
-    if not ENABLE_PARAPHRASE:
-        return text
-    clean = sanitize_text(text)
-    if not clean:
-        return text
-
-    paragraphs = [p.strip() for p in clean.split("\n") if p.strip()]
-    rewritten = []
-    success_count = 0
-
-    print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paragraphs)} paragraphs) {'─'*25}")
-
-    for i, para in enumerate(paragraphs):
-        orig_wc = len(para.split())
-
-        print(f"\n │ ┌─ Paragraph {i+1}/{len(paragraphs)} {'─'*50}")
-        print(f" │ │ ORIGINAL ({orig_wc} words):")
-        _print_wrapped(para, prefix=" │ │    ")
-        print(f" │ │ {'─'*60}")
-
-        prompt = (
-            f"Rewrite this job description paragraph professionally. "
-            f"Keep ALL facts, requirements, and responsibilities. "
-            f"Use different sentence structure and vocabulary. "
-            f"Output ONLY the rewritten paragraph — no labels, no explanation.\n\n"
-            f"Original:\n{para}"
-        )
-
-        best_result = None
-        best_sim    = 0.0
-        accepted_text = None
-
-        for attempt in range(3):
-            temp = round(0.65 + attempt * 0.08, 2)
-            print(f" │ │ Attempt {attempt+1}/3 (temp={temp}):")
-
-            raw = mistral_generate(prompt, max_tokens=500, temperature=temp)
-            result = clean_output(raw).strip()
-
-            rw  = len(result.split()) if result else 0
-            sim = similarity_score(para, result) if result and rw >= 5 else 0.0
-
-            if result:
-                print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
-                _print_wrapped(result, prefix=" │ │       ")
-            else:
-                print(f" │ │    Paraphrased : (no output from model)")
-
-            valid = bool(result) and rw >= 8 and sim >= 0.48
-
-            if not valid:
-                reasons = []
-                if not result: reasons.append("empty output")
-                if rw < 8:     reasons.append(f"too short ({rw} words, min=8)")
-                if sim < 0.48: reasons.append(f"sim={sim:.3f} < 0.48")
-                print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
-                if result and sim > best_sim:
-                    best_sim = sim
-                    best_result = result
-                    print(f" │ │       (stored as best fallback, sim={sim:.3f})")
-            else:
-                print(f" │ │    → ✅ ACCEPTED on attempt {attempt+1}")
-                rewritten.append(result)
-                success_count += 1
-                accepted_text = result
-                break
-
-            print(f" │ │ {'─'*60}")
-            time.sleep(1)
-
-        if accepted_text is None:
-            print(f" │ │ {'─'*60}")
-            if best_result and best_sim >= 0.40:
-                print(f" │ │ 🔁 FALLBACK — Using best attempt (sim={best_sim:.3f}):")
-                _print_wrapped(best_result, prefix=" │ │    ")
-                rewritten.append(best_result)
-                success_count += 1
-            else:
-                print(f" │ │ ⚠️  KEPT ORIGINAL — no acceptable paraphrase found (best sim={best_sim:.3f})")
-                rewritten.append(para)
-
-        print(f" │ └{'─'*62}")
-
-    print(f"\n │ SUMMARY: {success_count}/{len(paragraphs)} paragraphs successfully paraphrased")
-    print(f" └{'─'*80}\n")
-
-    return "\n\n".join(rewritten)
-
-
-def paraphrase_company(text: str) -> str:
-    if not ENABLE_PARAPHRASE:
-        return text
-    clean = sanitize_text(text)
-    if not clean:
-        return text
-
-    print(f"\n ┌─ COMPANY PARAPHRASE {'─'*43}")
-    orig_wc = len(clean.split())
-    print(f" │ Original ({orig_wc} words):")
-    _print_wrapped(clean, prefix=" │    ")
-    print(f" │ {'─'*60}")
-
-    prompt = (
-        f"Rewrite this company description professionally. "
-        f"Preserve all facts. Use different wording. "
-        f"Output ONLY the rewritten description.\n\nOriginal:\n{clean}"
-    )
-
-    raw = mistral_generate(prompt, max_tokens=600, temperature=0.68)
-    result = clean_output(raw)
-    rw  = len(result.split()) if result else 0
-    sim = similarity_score(clean, result) if result and rw >= 10 else 0.0
-
-    if result and rw >= 10:
-        print(f" │ Paraphrased ({rw} words, sim={sim:.3f}):")
-        _print_wrapped(result, prefix=" │    ")
-        print(f" │ → ✅ ACCEPTED")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return result
-    else:
-        reasons = []
-        if not result: reasons.append("empty output")
-        if rw < 10:    reasons.append(f"too short ({rw} words, min=10)")
-        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return clean
-
-
-def paraphrase_tagline(text: str) -> str:
-    if not ENABLE_PARAPHRASE:
-        return text
-    clean = sanitize_text(text[:300])
-    if not clean:
-        return text
-
-    print(f"\n ┌─ TAGLINE PARAPHRASE {'─'*43}")
-    print(f" │ Original : \"{clean}\"")
-    print(f" │ {'─'*60}")
-
-    prompt = (
-        f"Rewrite this company tagline as a crisp, professional phrase. "
-        f"Output ONLY the rewritten tagline (5–12 words). No explanation.\n\n"
-        f"Original: {clean}"
-    )
-
-    raw = mistral_generate(prompt, max_tokens=35, temperature=0.75)
-    result = clean_output(raw).split("\n")[0].strip().strip('"').strip("'")
-    wc  = len(result.split()) if result else 0
-
-    print(f" │ Paraphrased : \"{result}\"")
-    print(f" │ Words: {wc}")
-
-    if result and 3 <= wc <= 15:
-        print(f" │ → ✅ ACCEPTED")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return result
-    else:
-        reasons = []
-        if not result: reasons.append("empty output")
-        if wc < 3:     reasons.append(f"too short ({wc} words, min=3)")
-        if wc > 15:    reasons.append(f"too long ({wc} words, max=15)")
-        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return clean
-
-
-def _print_wrapped(text: str, prefix: str = "   ", width: int = 100):
-    """Helper: print long text word-wrapped at `width` chars."""
-    words = text.split()
-    line  = []
-    for w in words:
-        line.append(w)
-        if len(" ".join(line)) >= width:
-            print(f"{prefix}{' '.join(line)}")
-            line = []
-    if line:
-        print(f"{prefix}{' '.join(line)}")
-
-# =============================================================================
-#  DUPLICATE TRACKER
-# =============================================================================
-
-def _init_tracker():
-    if not os.path.exists(PROCESSED_IDS_FILE):
-        pd.DataFrame(columns=[
-            "Job ID", "Job URL", "Job Title", "Company Name",
-            "Status", "Timestamp", "WP ID",
-        ]).to_csv(PROCESSED_IDS_FILE, index=False)
-
-def load_processed_ids() -> tuple:
-    _init_tracker()
-    df = pd.read_csv(PROCESSED_IDS_FILE)
-    return (
-        set(df["Job ID"].fillna("").astype(str)),
-        set(df.get("Job URL", pd.Series()).fillna("").astype(str)),
-    )
-
-def _upsert_row(job_id: str, updates: dict):
-    _init_tracker()
-    df = pd.read_csv(PROCESSED_IDS_FILE)
-    mask = df["Job ID"].astype(str) == str(job_id)
-    if mask.any():
-        for col, val in updates.items():
-            if col in df.columns:
-                df.loc[mask, col] = val
-        df.loc[mask, "Timestamp"] = datetime.now().isoformat()
-    else:
-        row = {"Job ID": job_id, "Timestamp": datetime.now().isoformat()}
-        row.update(updates)
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df.to_csv(PROCESSED_IDS_FILE, index=False)
-
-def make_job_id(job_url: str, title: str = "", company: str = "", idx: int = 0) -> str:
-    if job_url:
-        return hashlib.md5(job_url.encode()).hexdigest()[:16]
-    seed = f"{title}{company}{idx}"
-    return hashlib.md5(seed.encode()).hexdigest()[:16]
-
-def mark_scraped(job_id, job_url, title, company):
-    _upsert_row(job_id, {"Job URL": job_url, "Job Title": title,
-                          "Company Name": company, "Status": "scraped"})
-
-def mark_paraphrased(job_id):
-    _upsert_row(job_id, {"Status": "paraphrased"})
-
-def mark_posted(job_id, wp_id, wp_url):
-    _upsert_row(job_id, {"Status": f"posted", "WP ID": wp_id})
-
-def mark_failed(job_id, reason):
-    _upsert_row(job_id, {"Status": f"failed|{reason}"})
-
-# =============================================================================
-#  HELPERS  (unchanged from v4)
+#  HELPERS
 # =============================================================================
 
 def should_skip_crawl(url: str) -> bool:
@@ -629,27 +192,39 @@ def is_bad_url(url: str) -> bool:
     if not url or not url.startswith("http"): return True
     return any(d in url.lower() for d in BAD_DOMAINS)
 
+def is_ats_url(url: str) -> bool:
+    """Return True if the URL is a known ATS — always treat as valid apply link."""
+    if not url: return False
+    return any(d in url.lower() for d in ATS_DOMAINS)
+
 def is_career_url(url: str) -> bool:
     l = url.lower()
-    return any(k in l for k in ["career","jobs","apply","vacanci","recruit","opening",
-                                  "hiring","work-with","join-us","join_us","opportunities"])
+    return any(k in l for k in [
+        "career","jobs","apply","vacanci","recruit","opening",
+        "hiring","work-with","join-us","join_us","opportunities",
+        "current-opening","job-listing","positions",
+    ])
 
 def is_contact_url(url: str) -> bool:
     l = url.lower()
-    return any(k in l for k in ["contact","about","reach","get-in","enquir","support",
-                                  "about-us","about_us"])
+    return any(k in l for k in [
+        "contact","about","reach","get-in","enquir","support",
+        "about-us","about_us",
+    ])
 
 def is_about_url(url: str) -> bool:
     l = url.lower()
-    return any(k in l for k in ["about","who-we-are","our-story","company","our-team",
-                                  "overview"])
+    return any(k in l for k in [
+        "about","who-we-are","our-story","company","our-team",
+        "overview","mission","vision",
+    ])
 
 def make_absolute(href: str, root_url: str) -> str:
     if not href: return ""
     href = href.strip()
-    if href.startswith("http"):   return href
+    if href.startswith("http"): return href
     if href.startswith("//"): return "https:" + href
-    if href.startswith("/"):  return root_url.rstrip("/") + href
+    if href.startswith("/"): return root_url.rstrip("/") + href
     return ""
 
 def decode_html_entities(s: str) -> str:
@@ -681,6 +256,7 @@ def _strip_li_tracking(url: str) -> str:
     return url
 
 def _title_similarity(a: str, b: str) -> float:
+    """Token-overlap similarity between two strings. Returns 0.0–1.0."""
     if not a or not b: return 0.0
     def tokens(s):
         return set(re.sub(r"[^a-z0-9 ]", " ", s.lower()).split())
@@ -688,8 +264,32 @@ def _title_similarity(a: str, b: str) -> float:
     if not ta or not tb: return 0.0
     return len(ta & tb) / max(len(ta), len(tb))
 
+def _follow_redirect_chain(url: str, max_hops: int = 4) -> str:
+    """
+    Follow up to max_hops HTTP redirects manually so we can inspect
+    every intermediate URL (useful for ATS redirect chains).
+    Returns the final URL (or the original if anything fails).
+    """
+    current = url
+    for _ in range(max_hops):
+        try:
+            r = requests.head(current, headers=_next_headers(),
+                              allow_redirects=False, timeout=8)
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc = r.headers.get("Location", "")
+                if loc:
+                    if not loc.startswith("http"):
+                        parsed = urlparse(current)
+                        loc = f"{parsed.scheme}://{parsed.netloc}{loc}"
+                    current = loc
+                    continue
+        except Exception:
+            pass
+        break
+    return current
+
 # =============================================================================
-#  HTTP  (with retry + back-off)
+#  HTTP  (with retry + back-off, rotating UA)
 # =============================================================================
 
 def fetch_page(url: str, follow_redirects: bool = True, retries: int = 3) -> str | None:
@@ -715,7 +315,7 @@ def fetch_page(url: str, follow_redirects: bool = True, retries: int = 3) -> str
     return None
 
 # =============================================================================
-#  DATE HELPERS  (unchanged)
+#  DATE HELPERS
 # =============================================================================
 
 def normalise_date_text(text: str) -> str:
@@ -740,13 +340,13 @@ def resolve_posted_date(raw: str) -> str:
     m = re.search(r"(\d+)\s*(hour|day|week|month|year)", text, re.I)
     if m:
         n, unit = int(m.group(1)), m.group(2).lower()
-        if "hour"  in unit: base -= timedelta(hours=n)
-        elif "day" in unit: base -= timedelta(days=n)
-        elif "week"in unit: base -= timedelta(weeks=n)
-        elif "month"in unit:
+        if "hour" in unit:   base -= timedelta(hours=n)
+        elif "day" in unit:  base -= timedelta(days=n)
+        elif "week" in unit: base -= timedelta(weeks=n)
+        elif "month" in unit:
             mo = base.month - n; yr = base.year + mo // 12; mo = mo % 12 or 12
             base = base.replace(year=yr, month=mo)
-        elif "year"in unit: base = base.replace(year=base.year - n)
+        elif "year" in unit: base = base.replace(year=base.year - n)
         return base.strftime("%Y-%m-%d")
     if re.search(r"just\s*now|today", text, re.I): return datetime.now().strftime("%Y-%m-%d")
     return datetime.now().strftime("%Y-%m-%d")
@@ -792,17 +392,17 @@ def estimate_deadline_from_posted(posted_text: str) -> str:
     m = re.search(r"(\d+)\s*(hour|day|week|month)", text, re.I)
     if m:
         n, unit = int(m.group(1)), m.group(2).lower()
-        if "hour" in unit:  base -= timedelta(hours=n)
-        elif "day"in unit:  base -= timedelta(days=n)
-        elif "week"in unit: base -= timedelta(weeks=n)
-        elif "month"in unit:
+        if "hour" in unit:   base -= timedelta(hours=n)
+        elif "day" in unit:  base -= timedelta(days=n)
+        elif "week" in unit: base -= timedelta(weeks=n)
+        elif "month" in unit:
             mo = base.month - n; yr = base.year + mo // 12; mo = mo % 12 or 12
             base = base.replace(year=yr, month=mo)
     mo = base.month + 3; yr = base.year + (mo - 1) // 12; mo = (mo - 1) % 12 + 1
     return base.replace(year=yr, month=mo).strftime("%Y-%m-%d")
 
 # =============================================================================
-#  TEXT CLEANERS  (unchanged)
+#  TEXT CLEANERS
 # =============================================================================
 
 def clean_description(raw: str) -> str:
@@ -881,7 +481,7 @@ def clean_logo_url(raw: str) -> str:
     return re.sub(r"[\"')\s]+$", "", raw)
 
 # =============================================================================
-#  EMAIL HELPERS  (unchanged)
+#  EMAIL HELPERS
 # =============================================================================
 
 def extract_email_from_text(text: str) -> str:
@@ -925,7 +525,7 @@ def scan_page_for_email(soup: BeautifulSoup, raw_html: str = "") -> str:
     return ""
 
 # =============================================================================
-#  DECODE / FOLLOW LINKEDIN APPLY URL  (unchanged)
+#  DECODE / FOLLOW LINKEDIN APPLY URL
 # =============================================================================
 
 def decode_linkedin_apply_url(raw: str) -> str:
@@ -961,7 +561,7 @@ def follow_linkedin_apply_button(soup: BeautifulSoup, job_url: str) -> str:
     return ""
 
 # =============================================================================
-#  JSON-LD PARSER  (unchanged)
+#  JSON-LD PARSER
 # =============================================================================
 
 def _parse_jsonld(html: str) -> dict:
@@ -976,6 +576,7 @@ def _parse_jsonld(html: str) -> dict:
         if isinstance(data, list):
             data = next((d for d in data if isinstance(d, dict)), {})
         if not isinstance(data, dict): continue
+
         schema_type = data.get("@type", "")
         if schema_type == "JobPosting":
             org = data.get("hiringOrganization", {}) or {}
@@ -1003,6 +604,7 @@ def _parse_jsonld(html: str) -> dict:
                 country = place.get("addressCountry", "")
                 if city or country:
                     result["location"] = ", ".join(filter(None, [city, country]))
+
         elif schema_type in ("Organization", "Corporation", "LocalBusiness"):
             result.update({
                 "company_name":     data.get("name", ""),
@@ -1015,7 +617,9 @@ def _parse_jsonld(html: str) -> dict:
                 "company_address":  _extract_address_jsonld(data.get("address", {})),
                 "company_about":    data.get("description", ""),
             })
+
     return result
+
 
 def _extract_salary_jsonld(obj) -> str:
     if not obj: return ""
@@ -1029,6 +633,7 @@ def _extract_salary_jsonld(obj) -> str:
         return f"{currency} {val}".strip()
     return ""
 
+
 def _extract_location_jsonld(obj) -> str:
     if not obj: return ""
     if isinstance(obj, list): obj = obj[0] if obj else {}
@@ -1041,6 +646,7 @@ def _extract_location_jsonld(obj) -> str:
             addr.get("addressCountry", ""),
         ]))
     return str(addr)
+
 
 def _extract_address_jsonld(obj) -> str:
     if not obj: return ""
@@ -1056,7 +662,7 @@ def _extract_address_jsonld(obj) -> str:
     return ""
 
 # =============================================================================
-#  EXTRACT COMPANY DATA FROM JOB PAGE  (unchanged)
+#  EXTRACT COMPANY DATA FROM JOB PAGE
 # =============================================================================
 
 def extract_company_from_job_page(html: str, soup: BeautifulSoup) -> dict:
@@ -1098,6 +704,18 @@ def extract_company_from_job_page(html: str, soup: BeautifulSoup) -> dict:
                 if src and "ghost" not in src.lower() and "placeholder" not in src.lower():
                     result["company_logo"] = src; break
 
+    for chip in soup.select(
+        ".job-details-jobs-unified-top-card__job-insight,"
+        ".jobs-unified-top-card__job-insight,"
+        ".jobs-details__salary-main-rail-card"
+    ):
+        text = chip.get_text(strip=True)
+        if not result.get("company_industry") and re.search(
+                r"technology|consulting|financial|healthcare|education|"
+                r"manufacturing|retail|media|energy|real estate|"
+                r"construction|automotive|telecom|pharmaceutical", text, re.I):
+            result["company_industry"] = text
+
     for script in soup.find_all("script"):
         txt = script.string or ""
         if not txt.strip(): continue
@@ -1128,128 +746,267 @@ def extract_company_from_job_page(html: str, soup: BeautifulSoup) -> dict:
     return result
 
 # =============================================================================
-#  DEEP COMPANY WEBSITE CRAWLER  (v4 — unchanged)
+#  ▶▶ v5: DEEP COMPANY WEBSITE CRAWLER
 # =============================================================================
 
 def crawl_company_website_deep(website_url: str, job_title: str) -> dict:
-    result = {"apply_url": "", "email": "", "method": ""}
-    if not website_url or should_skip_crawl(website_url): return result
+    """
+    Multi-layer apply-URL hunter:
+      1. Fetch company home page
+      2. Discover careers / jobs page via link text + URL patterns + HEAD probes
+      3. On the careers page, fuzzy-match the job title in anchor text AND
+         surrounding paragraph/li context
+      4. On the job detail page, find the real Apply button
+         – follow ATS redirect chains (Greenhouse, Lever, Workday, etc.)
+         – detect mailto: apply links
+      5. Fall back gracefully at each layer
 
+    Returns: {"apply_url": str, "email": str, "method": str}
+    Empty strings = not found at this layer.
+    """
+    result = {"apply_url": "", "email": "", "method": ""}
+    if not website_url or should_skip_crawl(website_url):
+        return result
+
+    # ── Time-box the entire function ─────────────────────────────────────────
     deadline = time.time() + 20
     root = website_url.rstrip("/")
     parsed_root = urlparse(root)
     root_domain = parsed_root.netloc
 
+    # ── Internal fetch helper ─────────────────────────────────────────────────
     def _get(url: str):
-        if time.time() > deadline: return None, None
+        """Return (html, soup) or (None, None). Respects deadline."""
+        if time.time() > deadline:
+            return None, None
         try:
             time.sleep(0.6)
-            r = requests.get(url, headers=_next_headers(), timeout=12, allow_redirects=True)
-            if r.status_code != 200: return None, None
+            r = requests.get(url, headers=_next_headers(),
+                             timeout=12, allow_redirects=True)
+            if r.status_code != 200:
+                return None, None
             html = r.text[:FETCH_CHAR_LIMIT]
             return html, BeautifulSoup(html, "html.parser")
         except Exception as e:
             log.debug(f"deep crawl fetch error ({url}): {e}")
             return None, None
 
-    def _links_from(soup: BeautifulSoup, base: str) -> list:
+    def _same_domain_links(soup: BeautifulSoup, base: str) -> list[tuple[str, str]]:
+        """Return [(href, link_text), ...] for all same-domain links."""
         out = []
         for tag in soup.find_all("a", href=True):
             href = make_absolute(tag.get("href", ""), base)
-            if not href or not href.startswith("http"): continue
-            if root_domain not in urlparse(href).netloc: continue
+            if not href or not href.startswith("http"):
+                continue
+            if root_domain not in urlparse(href).netloc:
+                continue
             out.append((href, tag.get_text(strip=True).lower()))
         return out
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 1 — Home page
+    # ─────────────────────────────────────────────────────────────────────────
     home_html, home_soup = _get(root)
-    if not home_html: return result
-    links = _links_from(home_soup, root)
+    if not home_html:
+        log.info(f"deep crawl: could not fetch home page {root}")
+        return result
 
-    CAREER_TEXT = re.compile(
+    home_links = _same_domain_links(home_soup, root)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 2 — Find the careers page
+    # ─────────────────────────────────────────────────────────────────────────
+    CAREER_TEXT_RE = re.compile(
         r"career|job|vacanc|opportunit|recruit|hiring|join\s*us|work\s*with\s*us|"
-        r"open\s*positions|current\s*opening", re.I)
-    careers_url = ""
-    for href, txt in links:
-        if CAREER_TEXT.search(txt) or is_career_url(href):
-            careers_url = href; break
+        r"open\s*positions?|current\s*openings?|we['']?re\s+hiring", re.I)
 
+    careers_url = ""
+
+    # Priority 1: link text matches
+    for href, txt in home_links:
+        if CAREER_TEXT_RE.search(txt) or is_career_url(href):
+            careers_url = href
+            log.info(f"deep crawl: careers page from home link → {careers_url}")
+            break
+
+    # Priority 2: common path probes
     if not careers_url:
-        for path in ["/careers","/jobs","/job-openings","/vacancies",
-                     "/work-with-us","/join-us","/opportunities"]:
+        for path in [
+            "/careers", "/jobs", "/job-openings", "/vacancies",
+            "/work-with-us", "/join-us", "/opportunities",
+            "/careers/open-positions", "/about/careers",
+        ]:
+            if time.time() > deadline:
+                break
             candidate = root + path
-            if time.time() > deadline: break
             try:
-                r = requests.head(candidate, headers=_next_headers(), timeout=8, allow_redirects=True)
+                r = requests.head(candidate, headers=_next_headers(),
+                                  timeout=6, allow_redirects=True)
                 if r.status_code == 200:
-                    careers_url = candidate; break
+                    careers_url = candidate
+                    log.info(f"deep crawl: careers page from HEAD probe → {careers_url}")
+                    break
             except Exception:
                 pass
 
     if not careers_url:
+        log.info(f"deep crawl: no careers page found at {root}")
         return result
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 3 — Find the specific job listing on the careers page
+    # ─────────────────────────────────────────────────────────────────────────
     careers_html, careers_soup = _get(careers_url)
-    if not careers_soup: return result
+    if not careers_soup:
+        return result
 
-    job_links = _links_from(careers_soup, careers_url)
+    career_links = _same_domain_links(careers_soup, careers_url)
+
+    # Score each link by:
+    #   a) anchor text similarity to job_title
+    #   b) surrounding context (parent <li> or <div> text)
     best_url, best_score = "", 0.0
-    for href, txt in job_links:
-        score = _title_similarity(job_title, txt)
+
+    for href, anchor_txt in career_links:
+        # Skip navigation / utility links
+        if any(skip in href.lower() for skip in ["#", "login", "sign-in", "signup",
+                                                   "register", "privacy", "terms"]):
+            continue
+
+        score = _title_similarity(job_title, anchor_txt)
+
+        # Boost score with surrounding context text
+        for tag in careers_soup.find_all("a", href=True):
+            abs_href = make_absolute(tag.get("href", ""), careers_url)
+            if abs_href != href:
+                continue
+            parent = tag.parent
+            if parent:
+                context_txt = parent.get_text(separator=" ", strip=True).lower()
+                ctx_score = _title_similarity(job_title, context_txt)
+                score = max(score, ctx_score * 0.85)   # slight discount for context
+            break
+
         if score > best_score:
             best_score, best_url = score, href
 
+    # Also try email on careers page as side-channel
     email_from_careers = scan_page_for_email(careers_soup, careers_html)
 
-    if best_score < 0.3:
+    if best_score < 0.30:
+        log.info(f"deep crawl: no close title match (best={best_score:.2f}) on careers page")
         if email_from_careers:
-            return {"apply_url": "", "email": email_from_careers, "method": "deep_careers_email"}
-        return {"apply_url": careers_url, "email": "", "method": "deep_careers_page"}
+            return {"apply_url": "", "email": email_from_careers,
+                    "method": "deep_careers_email"}
+        # Return the careers page itself as a best-effort apply URL
+        return {"apply_url": careers_url, "email": "",
+                "method": "deep_careers_page"}
 
+    log.info(f"deep crawl: matched '{job_title}' → {best_url}  (score={best_score:.2f})")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 4 — Job detail page: find the real Apply button
+    # ─────────────────────────────────────────────────────────────────────────
     job_html, job_soup = _get(best_url)
     if not job_soup:
         return {"apply_url": best_url, "email": "", "method": "deep_job_page_url"}
 
-    APPLY_TEXT  = re.compile(r"apply\s*now|apply\s*online|apply\s*for|submit\s*(application|cv|resume)|"
-                              r"apply\s*here|send\s*(cv|resume|application)", re.I)
-    APPLY_CLASS = re.compile(r"apply|btn-apply|cta-apply|job-apply", re.I)
+    # Patterns that indicate an Apply button / link
+    APPLY_TEXT_RE = re.compile(
+        r"apply\s*now|apply\s*online|apply\s*for\s+this|apply\s*here|"
+        r"submit\s*(your\s*)?(application|cv|resume)|send\s*(cv|resume|application)|"
+        r"click\s*to\s*apply|start\s*application", re.I)
+    APPLY_CLASS_RE = re.compile(
+        r"apply|btn[-_]?apply|cta[-_]?apply|job[-_]?apply|application[-_]?btn", re.I)
 
     apply_url = ""
+
+    # Scan all <a> tags for apply links
     for tag in job_soup.find_all("a", href=True):
-        txt = tag.get_text(strip=True)
-        cls = " ".join(tag.get("class", []))
-        href = make_absolute(tag.get("href", ""), best_url)
-        if not href: continue
-        if APPLY_TEXT.search(txt) or APPLY_CLASS.search(cls):
-            if href.startswith("mailto:"):
-                em = clean_email(href.replace("mailto:", ""))
-                if em: return {"apply_url": "", "email": em, "method": "deep_apply_email"}
-            if not is_bad_url(href):
-                apply_url = href; break
+        tag_text = tag.get_text(strip=True)
+        tag_cls  = " ".join(tag.get("class", []))
+        href     = make_absolute(tag.get("href", ""), best_url)
+        if not href:
+            continue
 
+        # mailto: → treat as email apply
+        if href.lower().startswith("mailto:"):
+            em = clean_email(href.replace("mailto:", "").replace("MAILTO:", ""))
+            if em:
+                log.info(f"deep crawl: mailto apply found → {em}")
+                return {"apply_url": "", "email": em, "method": "deep_apply_email"}
+
+        if APPLY_TEXT_RE.search(tag_text) or APPLY_CLASS_RE.search(tag_cls):
+            # Follow ATS redirect chains
+            resolved = _follow_redirect_chain(href) if is_ats_url(href) else href
+            if resolved and not is_bad_url(resolved):
+                apply_url = resolved
+                log.info(f"deep crawl: apply button found → {apply_url}")
+                break
+
+    # Fallback: <button> elements (some SPAs use JS forms)
     if not apply_url:
-        form = job_soup.find("form")
-        if form and form.get("action"):
-            action = make_absolute(form["action"], best_url)
-            if action and not is_bad_url(action):
-                apply_url = action
+        for btn in job_soup.find_all("button"):
+            if APPLY_TEXT_RE.search(btn.get_text(strip=True)):
+                # Try data-href or onclick URL
+                data_href = btn.get("data-href", "") or btn.get("data-url", "")
+                if data_href:
+                    href = make_absolute(data_href, best_url)
+                    if href and not is_bad_url(href):
+                        apply_url = href
+                        break
 
+    # Fallback: form action
+    if not apply_url:
+        for form in job_soup.find_all("form"):
+            action = make_absolute(form.get("action", ""), best_url)
+            if action and not is_bad_url(action) and "apply" in action.lower():
+                apply_url = action
+                break
+
+    # Fallback: any ATS link on the job page
+    if not apply_url:
+        for tag in job_soup.find_all("a", href=True):
+            href = make_absolute(tag.get("href", ""), best_url)
+            if href and is_ats_url(href) and not is_bad_url(href):
+                apply_url = _follow_redirect_chain(href)
+                log.info(f"deep crawl: ATS link found on job page → {apply_url}")
+                break
+
+    # Fallback: email anywhere on job detail page
     if not apply_url:
         em = scan_page_for_email(job_soup, job_html)
-        if em: return {"apply_url": "", "email": em, "method": "deep_job_email"}
+        if em:
+            return {"apply_url": "", "email": em, "method": "deep_job_email"}
 
     if apply_url:
         return {"apply_url": apply_url, "email": "", "method": "deep_apply_button"}
 
+    # Nothing found — return job page URL as best effort
     return {"apply_url": best_url, "email": "", "method": "deep_job_page_url"}
 
+
 # =============================================================================
-#  ABOUT / CONTACT / FOOTER SCRAPER  (v4 — unchanged)
+#  ▶▶ v5: ABOUT / CONTACT / FOOTER SCRAPER
 # =============================================================================
 
 def scrape_about_contact_footer(website_url: str) -> dict:
-    empty = {"address": "", "phone": "", "email": "", "founded": "",
-             "description": "", "social_links": ""}
-    if not website_url or should_skip_crawl(website_url): return empty
+    """
+    Visit the company's home page (footer), about page, and contact page
+    to harvest any company details missing from LinkedIn.
+
+    Tries these sub-pages:
+        /about  /about-us  /contact  /contact-us  /our-story  /team  /company
+
+    Returns a dict with keys (all may be empty strings):
+        address, phone, email, founded, description, social_links
+    """
+    empty = {
+        "address": "", "phone": "", "email": "",
+        "founded": "", "description": "", "social_links": "",
+    }
+    if not website_url or should_skip_crawl(website_url):
+        return empty
 
     root = website_url.rstrip("/")
     parsed_root = urlparse(root)
@@ -1257,11 +1014,14 @@ def scrape_about_contact_footer(website_url: str) -> dict:
     deadline = time.time() + 15
 
     def _get(url: str):
-        if time.time() > deadline: return None, None
+        if time.time() > deadline:
+            return None, None
         try:
             time.sleep(0.5)
-            r = requests.get(url, headers=_next_headers(), timeout=12, allow_redirects=True)
-            if r.status_code != 200: return None, None
+            r = requests.get(url, headers=_next_headers(),
+                             timeout=12, allow_redirects=True)
+            if r.status_code != 200:
+                return None, None
             html = r.text[:FETCH_CHAR_LIMIT]
             return html, BeautifulSoup(html, "html.parser")
         except Exception as e:
@@ -1271,79 +1031,162 @@ def scrape_about_contact_footer(website_url: str) -> dict:
     result = dict(empty)
 
     def _harvest(soup: BeautifulSoup, html: str):
+        """Pull data points from any page soup and merge into result (empty fields only)."""
         full_text = soup.get_text(" ", strip=True)
+
+        # ── Email ─────────────────────────────────────────────────────────────
         if not result["email"]:
             em = scan_page_for_email(soup, html)
-            if em: result["email"] = em
+            if em:
+                result["email"] = em
+
+        # ── Phone (E.164-ish + local formats) ─────────────────────────────────
         if not result["phone"]:
-            ph = re.search(r"(?:\+?\d[\d\s\-().]{6,18}\d)(?=\s*(?:$|\n|[^\d]))", full_text)
-            if ph:
-                candidate = ph.group(0).strip()
-                if len(re.sub(r"\D", "", candidate)) >= 7:
-                    result["phone"] = candidate
+            # Multiple phone patterns, most specific first
+            ph_patterns = [
+                r"\+\d[\d\s\-().]{7,18}\d",           # international +XX …
+                r"\b0\d[\d\s\-().]{6,14}\d",           # local 0X format
+                r"\(\d{2,4}\)\s*\d{3,4}[\s\-]\d{3,4}",# (area) 123-456
+            ]
+            for pat in ph_patterns:
+                ph_m = re.search(pat, full_text)
+                if ph_m:
+                    candidate = ph_m.group(0).strip()
+                    digits = re.sub(r"\D", "", candidate)
+                    if 7 <= len(digits) <= 15:
+                        result["phone"] = candidate
+                        break
+
+        # ── Address ───────────────────────────────────────────────────────────
         if not result["address"]:
-            for el in soup.select("[itemprop='address'],[itemprop='streetAddress']"):
-                t = el.get_text(strip=True)
-                if t: result["address"] = t; break
+            # Schema.org microdata
+            for el in soup.select(
+                "[itemprop='address'],[itemprop='streetAddress'],"
+                "[itemtype*='PostalAddress']"
+            ):
+                t = el.get_text(separator=", ", strip=True)
+                if len(t) > 10:
+                    result["address"] = t[:250]
+                    break
+
+            # Heuristic: number + street keyword pattern
             if not result["address"]:
                 addr_m = re.search(
-                    r"\d+[\w\s,.-]{5,80}(?:street|st\b|avenue|ave\b|road|rd\b|"
-                    r"boulevard|blvd|lane|ln|drive|dr\b|way|close|court|building|"
-                    r"floor|suite|tower|plaza|district|zone)", full_text, re.I)
+                    r"\d+[\w\s,.\-]{5,120}"
+                    r"(?:street|st\b|avenue|ave\b|road|rd\b|boulevard|blvd|"
+                    r"lane|ln\b|drive|dr\b|way\b|close|court|building|floor|"
+                    r"suite|tower|plaza|district|zone|p\.?\s*o\.?\s*box|"
+                    r"riyadh|jeddah|dammam|khobar|mecca|madinah|"
+                    r"dubai|abu dhabi|doha|kuwait|bahrain)",
+                    full_text, re.I)
                 if addr_m:
-                    result["address"] = addr_m.group(0).strip()[:200]
+                    result["address"] = addr_m.group(0).strip()[:250]
+
+        # ── Founded year ──────────────────────────────────────────────────────
         if not result["founded"]:
             fy = re.search(
                 r"(?:founded|established|incorporated|since|est\.?)\s*[:\-]?\s*((?:19|20)\d{2})",
                 full_text, re.I)
-            if fy: result["founded"] = fy.group(1)
+            if fy:
+                result["founded"] = fy.group(1)
+
+        # ── Description ───────────────────────────────────────────────────────
         if not result["description"]:
+            # og:description / meta description
             og = (soup.find("meta", property="og:description") or
                   soup.find("meta", attrs={"name": "description"}))
             if og:
                 desc = og.get("content", "").strip()
-                if len(desc) > 40: result["description"] = desc
+                if len(desc) > 40:
+                    result["description"] = desc[:600]
+            # Fallback: first substantial <p>
             if not result["description"]:
                 for p in soup.find_all("p"):
                     t = p.get_text(strip=True)
                     if len(t) > 80:
-                        result["description"] = t[:500]; break
+                        result["description"] = t[:600]
+                        break
+
+        # ── Social links ──────────────────────────────────────────────────────
         if not result["social_links"]:
             socials = []
             for a in soup.find_all("a", href=True):
                 href = a["href"].lower()
-                for platform in ["twitter.com","x.com","facebook.com","instagram.com",
-                                  "linkedin.com","youtube.com","tiktok.com"]:
-                    if platform in href and href not in socials:
-                        socials.append(a["href"]); break
-            if socials: result["social_links"] = ", ".join(socials[:5])
+                for platform in [
+                    "twitter.com", "x.com", "facebook.com", "instagram.com",
+                    "linkedin.com", "youtube.com", "tiktok.com",
+                ]:
+                    if platform in href and a["href"] not in socials:
+                        socials.append(a["href"])
+                        break
+            if socials:
+                result["social_links"] = ", ".join(socials[:5])
 
+    # ── Home page (always try) ────────────────────────────────────────────────
     home_html, home_soup = _get(root)
     if home_soup:
-        footer = home_soup.find("footer") or home_soup.select_one("#footer,.footer,[class*='footer']")
+        # Focus on footer first
+        footer = (home_soup.find("footer") or
+                  home_soup.select_one("#footer,.footer,[class*='footer']"))
         if footer:
             _harvest(BeautifulSoup(str(footer), "html.parser"), str(footer))
+        # Then the whole home page
         _harvest(home_soup, home_html)
+
+        # Discover about/contact URLs from the home page nav
         about_url = contact_url = ""
         for tag in home_soup.find_all("a", href=True):
             href = make_absolute(tag.get("href", ""), root)
-            if not href or root_domain not in urlparse(href).netloc: continue
+            if not href or root_domain not in urlparse(href).netloc:
+                continue
             txt = tag.get_text(strip=True).lower()
             if not about_url and (is_about_url(href) or "about" in txt):
                 about_url = href
             if not contact_url and (is_contact_url(href) or "contact" in txt):
                 contact_url = href
-            if about_url and contact_url: break
+            if about_url and contact_url:
+                break
+
+        # Common fallback paths when links not found in nav
+        if not about_url and time.time() < deadline:
+            for path in ["/about", "/about-us", "/our-story", "/company", "/who-we-are"]:
+                try:
+                    r = requests.head(root + path, headers=_next_headers(),
+                                      timeout=5, allow_redirects=True)
+                    if r.status_code == 200:
+                        about_url = root + path
+                        break
+                except Exception:
+                    pass
+
+        if not contact_url and time.time() < deadline:
+            for path in ["/contact", "/contact-us", "/reach-us", "/get-in-touch"]:
+                try:
+                    r = requests.head(root + path, headers=_next_headers(),
+                                      timeout=5, allow_redirects=True)
+                    if r.status_code == 200:
+                        contact_url = root + path
+                        break
+                except Exception:
+                    pass
+
+        # ── About page ────────────────────────────────────────────────────────
         if about_url and time.time() < deadline:
             about_html, about_soup = _get(about_url)
-            if about_soup: _harvest(about_soup, about_html)
+            if about_soup:
+                _harvest(about_soup, about_html)
+
+        # ── Contact page ──────────────────────────────────────────────────────
         if contact_url and time.time() < deadline:
             contact_html, contact_soup = _get(contact_url)
-            if contact_soup: _harvest(contact_soup, contact_html)
+            if contact_soup:
+                _harvest(contact_soup, contact_html)
+
     return result
 
+
 # =============================================================================
-#  COMPANY PAGE SCRAPER  (unchanged)
+#  COMPANY PAGE SCRAPER  (LinkedIn — unchanged from v4)
 # =============================================================================
 
 def scrape_company_details(company_url: str) -> dict:
@@ -1352,14 +1195,17 @@ def scrape_company_details(company_url: str) -> dict:
         "founded":"","specialties":"","website":"","logo":"","about":"",
     }
     if not company_url: return empty
+
     log.info(f"Scraping company page: {company_url}")
     base_url = re.sub(r"\?.*$", "", company_url.rstrip("/"))
     html = None
+
     guest_url = base_url.replace(
         "https://www.linkedin.com/company/",
         "https://www.linkedin.com/company-guest/",
     )
     if guest_url != base_url: html = fetch_page(guest_url)
+
     if not html:
         for attempt in range(3):
             try:
@@ -1376,9 +1222,11 @@ def scrape_company_details(company_url: str) -> dict:
             except Exception as e:
                 log.warning(f"Company page fetch error (attempt {attempt+1}): {e}")
                 time.sleep(2 + attempt * 2)
+
     if not html: return empty
+
     soup = BeautifulSoup(html, "html.parser")
-    ld   = _parse_jsonld(html)
+    ld = _parse_jsonld(html)
 
     def _sel(*selectors) -> str:
         for s in selectors:
@@ -1439,7 +1287,7 @@ def scrape_company_details(company_url: str) -> dict:
     }
 
 # =============================================================================
-#  WORDPRESS LOGO UPLOAD  (unchanged)
+#  WORDPRESS LOGO UPLOAD
 # =============================================================================
 
 def upload_logo_to_wordpress(logo_url: str, company_name: str) -> str:
@@ -1450,7 +1298,7 @@ def upload_logo_to_wordpress(logo_url: str, company_name: str) -> str:
         if r.status_code != 200: return ""
         ct = r.headers.get("Content-Type", "image/jpeg")
         ext = "png" if "png" in ct else "jpg"
-        fn  = re.sub(r"[^a-z0-9]", "-", company_name.lower()) + "-logo." + ext
+        fn = re.sub(r"[^a-z0-9]", "-", company_name.lower()) + "-logo." + ext
         creds = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
         wr = requests.post(WP_URL + "media",
                            headers={"Authorization": "Basic " + creds,
@@ -1464,7 +1312,7 @@ def upload_logo_to_wordpress(logo_url: str, company_name: str) -> str:
     return ""
 
 # =============================================================================
-#  COMPANY WEBSITE CRAWLER  (v3 fallback — unchanged)
+#  v3 COMPANY WEBSITE CRAWLER (fallback — unchanged)
 # =============================================================================
 
 def crawl_company_website(website_url: str, job_title: str) -> dict:
@@ -1514,67 +1362,111 @@ def crawl_company_website(website_url: str, job_title: str) -> dict:
     return {"url": root_url, "email": "", "method": "fallback_website"}
 
 # =============================================================================
-#  APPLICATION DETAILS EXTRACTOR  (unchanged)
+#  APPLICATION DETAILS EXTRACTOR  (v5 — updated priority chain)
 # =============================================================================
 
-def extract_application_details(job_url: str, soup: BeautifulSoup,
-                                  company_website: str, ld: dict,
-                                  job_title: str = "") -> dict:
+def extract_application_details(
+    job_url: str,
+    soup: BeautifulSoup,
+    company_website: str,
+    ld: dict,
+    job_title: str = "",
+    site_info: dict | None = None,
+) -> dict:
+    """
+    Priority chain:
+      0  JSON-LD apply URL
+      1  LinkedIn "Apply" button on the job page
+      2  Script tags on the job page
+      3  ▶▶ v5 deep crawl: home → careers → job listing → Apply button
+      4  Links / URLs in the job description
+      5  Email in the job description
+      6  Email from site_info (about/contact/footer scrape)
+      7  v3 company website fallback crawl
+    """
     desc_text = ""
     for sel in [".show-more-less-html__markup", ".description__text"]:
         el = soup.select_one(sel)
-        if el: desc_text = el.get_text(); break
+        if el:
+            desc_text = el.get_text()
+            break
 
+    # ── 0. JSON-LD ───────────────────────────────────────────────────────────
     if ld.get("apply_url") and not is_bad_url(ld["apply_url"]):
+        log.info(f"apply found via JSON-LD: {ld['apply_url']}")
         return {"url": ld["apply_url"], "email": "", "method": "s0_jsonld"}
 
+    # ── 1. LinkedIn apply button ──────────────────────────────────────────────
     apply_btn = follow_linkedin_apply_button(soup, job_url)
     if apply_btn:
+        log.info(f"apply found via LinkedIn button: {apply_btn}")
         return {"url": apply_btn, "email": "", "method": "s0_apply_button"}
 
+    # ── 2. Script tags on job page ────────────────────────────────────────────
     for script in soup.find_all("script"):
         txt = script.string or ""
-        for pat in [r'"applyStartUrl"\s*:\s*"([^"]+)"',
-                    r'"applicationUrl"\s*:\s*"([^"]+)"']:
+        for pat in [
+            r'"applyStartUrl"\s*:\s*"([^"]+)"',
+            r'"applicationUrl"\s*:\s*"([^"]+)"',
+        ]:
             m = re.search(pat, txt)
             if m:
                 cand = decode_html_entities(m.group(1)).replace("\\", "")
                 if cand.startswith("http") and not is_bad_url(cand):
+                    log.info(f"apply found via script tag: {cand}")
                     return {"url": cand, "email": "", "method": "s1b_script_tag"}
 
+    # ── 3. Deep crawl company website ────────────────────────────────────────
     if company_website and not should_skip_crawl(company_website):
+        log.info(f"v5 deep crawl starting: {company_website} for '{job_title}'")
         deep = crawl_company_website_deep(company_website, job_title)
         if deep.get("email"):
+            log.info(f"apply found via deep crawl (email): {deep['email']}")
             return {"url": "", "email": deep["email"], "method": deep["method"]}
         if deep.get("apply_url") and not is_bad_url(deep["apply_url"]):
+            log.info(f"apply found via deep crawl (url): {deep['apply_url']}")
             return {"url": deep["apply_url"], "email": "", "method": deep["method"]}
 
+    # ── 4. Links / URLs in job description ────────────────────────────────────
     desc_el = (soup.select_one(".show-more-less-html__markup") or
                soup.select_one(".description__text"))
     if desc_el:
         for a in desc_el.find_all("a", href=True):
             h = a.get("href", "")
-            if not is_bad_url(h): return {"url": h, "email": "", "method": "s3_desc_link"}
+            if not is_bad_url(h):
+                log.info(f"apply found via description link: {h}")
+                return {"url": h, "email": "", "method": "s3_desc_link"}
 
     for u in re.findall(r"https?://[^\s\"'<>)(,\]]+", desc_text):
         u = re.sub(r"[.,;:!?)]+$", "", u)
-        if not is_bad_url(u): return {"url": u, "email": "", "method": "s4_desc_url"}
+        if not is_bad_url(u):
+            log.info(f"apply found via description URL: {u}")
+            return {"url": u, "email": "", "method": "s4_desc_url"}
 
     em = extract_email_from_text(desc_text)
-    if em: return {"url": "", "email": em, "method": "s5_desc_email"}
+    if em:
+        log.info(f"apply found via description email: {em}")
+        return {"url": "", "email": em, "method": "s5_desc_email"}
 
+    # ── 5. Email from site_info (about/contact/footer scrape) ─────────────────
+    if site_info and site_info.get("email"):
+        log.info(f"apply found via site_info email: {site_info['email']}")
+        return {"url": "", "email": site_info["email"], "method": "site_info_email"}
+
+    # ── 6. v3 fallback crawl ──────────────────────────────────────────────────
     resolved = decode_linkedin_apply_url(company_website) or company_website
     if resolved and not is_bad_url(resolved):
         if should_skip_crawl(resolved):
             return {"url": resolved, "email": "", "method": "fallback_website"}
         res = crawl_company_website(resolved, job_title)
-        if res.get("email") or res.get("url"): return res
+        if res.get("email") or res.get("url"):
+            return res
         return {"url": resolved, "email": "", "method": "fallback_website"}
 
     return {"url": "", "email": "", "method": "not_found"}
 
 # =============================================================================
-#  JOB CRITERIA HELPERS  (unchanged)
+#  JOB CRITERIA HELPERS
 # =============================================================================
 
 def get_job_criteria(soup: BeautifulSoup, label: str) -> str:
@@ -1615,7 +1507,7 @@ def get_workplace_type(soup: BeautifulSoup) -> str:
     return ""
 
 # =============================================================================
-#  JOB FIELD INFERENCE  (unchanged)
+#  JOB FIELD INFERENCE
 # =============================================================================
 
 FIELD_KEYWORD_MAP = [
@@ -1726,28 +1618,28 @@ def infer_job_field(title: str, description: str) -> str:
     return ""
 
 # =============================================================================
-#  QUALIFICATION / EXPERIENCE EXTRACTORS  (unchanged)
+#  QUALIFICATION / EXPERIENCE EXTRACTORS
 # =============================================================================
 
 QUALIFICATION_TIERS = [
-    ("PhD / Doctorate",         ["phd","ph.d","doctorate","doctoral","doctor of philosophy"]),
-    ("Master's Degree",         ["master","msc","m.sc","ma ","m.a ","mba","m.b.a","meng","m.eng","mphil",
-                                  "postgraduate","post-graduate","post graduate"]),
-    ("Bachelor's Degree",       ["bachelor","bsc","b.sc","ba ","b.a ","beng","b.eng","bcom","b.com","bba",
-                                  "llb","degree in","undergraduate degree","honours degree","hons"]),
-    ("Higher National Diploma", ["hnd","hnc","higher national diploma","higher national certificate",
-                                  "higher diploma","advanced diploma"]),
-    ("Diploma",                 ["diploma","dip ","dip.","associate degree","foundation degree"]),
+    ("PhD / Doctorate",          ["phd","ph.d","doctorate","doctoral","doctor of philosophy"]),
+    ("Master's Degree",          ["master","msc","m.sc","ma ","m.a ","mba","m.b.a","meng","m.eng","mphil",
+                                   "postgraduate","post-graduate","post graduate"]),
+    ("Bachelor's Degree",        ["bachelor","bsc","b.sc","ba ","b.a ","beng","b.eng","bcom","b.com","bba",
+                                   "llb","degree in","undergraduate degree","honours degree","hons"]),
+    ("Higher National Diploma",  ["hnd","hnc","higher national diploma","higher national certificate",
+                                   "higher diploma","advanced diploma"]),
+    ("Diploma",                  ["diploma","dip ","dip.","associate degree","foundation degree"]),
     ("Professional Certification",["acca","cpa","cfa","cima","pmp","prince2","cissp","aws certified",
-                                    "comptia","cisco","ccna","ccnp","shrm","cipd","chartered",
-                                    "certified public","certified financial","certified project",
-                                    "professional certification","professional certificate"]),
-    ("A-Levels / HSC",          ["a-level","a level","hsc","higher school certificate","ib diploma",
-                                  "international baccalaureate","gce advanced"]),
+                                   "comptia","cisco","ccna","ccnp","shrm","cipd","chartered",
+                                   "certified public","certified financial","certified project",
+                                   "professional certification","professional certificate"]),
+    ("A-Levels / HSC",           ["a-level","a level","hsc","higher school certificate","ib diploma",
+                                   "international baccalaureate","gce advanced"]),
     ("O-Levels / School Certificate",["o-level","o level","igcse","gcse","school certificate",
-                                       "sc ","cpe","certificate of primary"]),
+                                      "sc ","cpe","certificate of primary"]),
     ("No Formal Qualification Required",["no qualification","no degree","no formal","school leaver",
-                                          "entry level","no experience required","training provided","will train"]),
+                                         "entry level","no experience required","training provided","will train"]),
 ]
 
 def extract_qualification(text: str) -> str:
@@ -1792,20 +1684,10 @@ def extract_experience(text: str) -> str:
     return ""
 
 # =============================================================================
-#  JOB DETAIL SCRAPER  (v4 + paraphrase integrated)
+#  JOB DETAIL SCRAPER  (v5)
 # =============================================================================
 
-def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) -> dict | None:
-    """
-    Scrape a single LinkedIn job.
-    Returns the job dict (with paraphrased fields) or None.
-    processed_ids / processed_urls are used to skip duplicates early.
-    """
-    job_id = make_job_id(job_url)
-    if job_id in processed_ids or job_url in processed_urls:
-        print(C_DIM(f"  ⧳ Already processed — skipped ({job_url})"))
-        return None
-
+def scrape_job_details(job_url: str) -> dict | None:
     log.info(f"Scraping job: {job_url}")
     try:
         resp = requests.get(job_url, headers=_next_headers(), timeout=20)
@@ -1825,17 +1707,18 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
 
     title = sel_text(".top-card-layout__title", "h1.topcard__title",
                      ".job-details-jobs-unified-top-card__job-title", "h1")
-    if not title:
-        return None
-
-    company_name_fallback = sel_text(".topcard__org-name-link",
-                                     ".job-details-jobs-unified-top-card__company-name",
-                                     ".topcard__flavor")
-    company_url_el = (soup.select_one(".topcard__org-name-link") or
-                      soup.select_one(".job-details-jobs-unified-top-card__company-name a"))
-    company_url  = company_url_el.get("href", "") if company_url_el else ""
-    location     = sel_text(".topcard__flavor--bullet",
-                             ".job-details-jobs-unified-top-card__bullet")
+    company_name_fallback = sel_text(
+        ".topcard__org-name-link",
+        ".job-details-jobs-unified-top-card__company-name",
+        ".topcard__flavor",
+    )
+    company_url_el = (
+        soup.select_one(".topcard__org-name-link") or
+        soup.select_one(".job-details-jobs-unified-top-card__company-name a")
+    )
+    company_url = company_url_el.get("href", "") if company_url_el else ""
+    location = sel_text(".topcard__flavor--bullet",
+                        ".job-details-jobs-unified-top-card__bullet")
     workplace_type = get_workplace_type(soup)
 
     time_el = soup.find("time")
@@ -1844,7 +1727,7 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
                           ".job-details-jobs-unified-top-card__posted-date")
     posted_date = resolve_posted_date(raw_posted)
 
-    raw_desc    = sel_text(".show-more-less-html__markup", ".description__text")
+    raw_desc = sel_text(".show-more-less-html__markup", ".description__text")
     description = clean_description(raw_desc)
 
     salary = ""
@@ -1858,31 +1741,32 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
                 salary = t; break
 
     raw_job_type = get_job_criteria(soup, "Employment type") or workplace_type
-    job_type     = raw_job_type or "Full-time"
+    job_type = raw_job_type or "Full-time"
 
     linkedin_function = get_job_criteria(soup, "Job function")
     linkedin_industry = get_job_criteria(soup, "Industries")
+    industry = linkedin_industry or get_job_criteria(soup, "Industries")
 
-    real_deadline      = parse_deadline(soup)
+    real_deadline = parse_deadline(soup)
     estimated_deadline = estimate_deadline_from_posted(posted_date) if not real_deadline else ""
     effective_deadline = real_deadline or estimated_deadline
 
-    # ── Layer 1: job-page extraction ─────────────────────────────────────────
+    # ── LAYER 1: job-page extraction ─────────────────────────────────────────
     job_page_co = extract_company_from_job_page(html, soup)
-    ld          = _parse_jsonld(html)
+    ld = _parse_jsonld(html)
 
-    # ── Layer 2: LinkedIn company page ───────────────────────────────────────
+    # ── LAYER 2: LinkedIn company page ───────────────────────────────────────
     time.sleep(0.5)
     company = scrape_company_details(company_url)
 
-    # ── Layer 3: merge LinkedIn sources ──────────────────────────────────────
+    # ── LAYER 3: merge LinkedIn sources ──────────────────────────────────────
     def _first(*vals) -> str:
         for v in vals:
             if v and str(v).strip(): return str(v).strip()
         return ""
 
     merged_name     = _first(company.get("name"),     job_page_co.get("company_name"),  company_name_fallback)
-    merged_industry = _first(company.get("industry"), job_page_co.get("company_industry"), linkedin_industry)
+    merged_industry = _first(company.get("industry"), job_page_co.get("company_industry"), linkedin_industry, industry)
     merged_logo     = _first(company.get("logo"),     job_page_co.get("company_logo"))
     merged_website  = _first(company.get("website"),  job_page_co.get("company_website"))
     merged_hq       = _first(company.get("headquarters"), job_page_co.get("company_address"))
@@ -1890,28 +1774,34 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     merged_type     = _first(company.get("type"))
     merged_about    = _first(company.get("about"),    job_page_co.get("company_about"))
 
-    # ── Layer 4: deep company website crawl ──────────────────────────────────
+    # ── LAYER 4: deep company website crawl for richer company info ──────────
+    site_info: dict = {}
     if merged_website and not should_skip_crawl(merged_website):
+        log.info(f"v5 about/contact/footer crawl: {merged_website}")
         site_info = scrape_about_contact_footer(merged_website)
-        if not merged_hq     and site_info.get("address"):     merged_hq      = site_info["address"]
-        if not merged_founded and site_info.get("founded"):    merged_founded  = site_info["founded"]
-        if not merged_about  and site_info.get("description"): merged_about   = site_info["description"]
-        if site_info.get("phone") and not re.search(r"\d{5,}", merged_about or ""):
+
+        if not merged_hq      and site_info.get("address"):
+            merged_hq = site_info["address"]
+        if not merged_founded and site_info.get("founded"):
+            merged_founded = site_info["founded"]
+        if not merged_about   and site_info.get("description"):
+            merged_about = site_info["description"]
+
+        # Append phone to companyDetails if we captured one
+        if site_info.get("phone"):
             phone_note = f"Phone: {site_info['phone']}"
-            merged_about = (merged_about + "\n" + phone_note).strip() if merged_about else phone_note
-    else:
-        site_info = {}
+            if phone_note not in (merged_about or ""):
+                merged_about = (merged_about + "\n" + phone_note).strip() if merged_about else phone_note
 
     job_field = linkedin_function or merged_industry or infer_job_field(title, description)
 
-    # ── Layer 5: application details ─────────────────────────────────────────
+    # ── LAYER 5: application details (deep crawl + all fallbacks) ────────────
     time.sleep(0.2)
     apply_data = extract_application_details(
-        job_url, soup, merged_website, ld, job_title=title)
-
-    if not apply_data.get("email") and not apply_data.get("url"):
-        if site_info.get("email"):
-            apply_data = {"url": "", "email": site_info["email"], "method": "site_info_email"}
+        job_url, soup, merged_website, ld,
+        job_title=title,
+        site_info=site_info,
+    )
 
     raw_apply = ""
     if apply_data.get("email"):
@@ -1923,38 +1813,8 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     qualifications = extract_qualification(description)
     experience     = extract_experience(description)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  ▶▶ PARAPHRASE — title, description, company about
-    # ─────────────────────────────────────────────────────────────────────────
-    mark_scraped(job_id, job_url, title, merged_name)
-    processed_ids.add(job_id)
-    processed_urls.add(job_url)
-
-    paraphrased_title = title
-    paraphrased_desc  = description
-    paraphrased_about = merged_about
-
-    if ENABLE_PARAPHRASE and MISTRAL_API_KEY != "your_mistral_api_key_here":
-        print(C_BLUE(f"\n  ✍️  Paraphrasing '{title}' ..."))
-
-        paraphrased_title = paraphrase_title(title)
-        paraphrased_desc  = paraphrase_description(description)
-        if merged_about:
-            paraphrased_about = paraphrase_company(merged_about)
-
-        mark_paraphrased(job_id)
-    else:
-        print(C_DIM("  ⚠️  Paraphrasing skipped (ENABLE_PARAPHRASE=False or no API key)"))
-
     return {
-        # Paraphrased fields (used for WP post + Excel)
-        "jobTitle":          paraphrased_title,
-        "jobDescription":    paraphrased_desc,
-        "companyDetails":    paraphrased_about,
-        # Original fields preserved for reference
-        "originalTitle":     title,
-        "originalDesc":      description,
-        # Structured fields
+        "jobTitle":          title,
         "jobType":           job_type,
         "jobQualifications": qualifications,
         "jobExperience":     experience,
@@ -1962,6 +1822,7 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
         "jobField":          job_field,
         "datePosted":        posted_date,
         "deadline":          effective_deadline,
+        "jobDescription":    description,
         "application":       apply_link,
         "companyUrl":        company_url,
         "companyName":       merged_name,
@@ -1971,150 +1832,12 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
         "companyType":       merged_type,
         "companyWebsite":    merged_website,
         "companyAddress":    merged_hq,
+        "companyDetails":    merged_about,
         "jobUrl":            job_url,
         "estimatedDeadline": estimated_deadline,
         "salaryRange":       salary,
-        "_jobId":            job_id,
+        "_apply_method":     apply_data.get("method", ""),   # internal diagnostic
     }
-
-# =============================================================================
-#  WORDPRESS POSTING
-# =============================================================================
-
-def _wp_auth_headers() -> dict:
-    token = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
-
-def get_or_create_term(taxonomy_url: str, name: str) -> int | None:
-    if not name or not name.strip(): return None
-    slug = re.sub(r"[^a-z0-9-]", "-", name.lower().strip())
-    h = _wp_auth_headers()
-    try:
-        r = requests.get(f"{taxonomy_url}?slug={slug}", headers=h, timeout=10, verify=False)
-        terms = r.json()
-        if isinstance(terms, list) and terms:
-            return terms[0]["id"]
-    except Exception:
-        pass
-    try:
-        r = requests.post(taxonomy_url, json={"name": name, "slug": slug},
-                          headers=h, auth=(WP_USER, WP_PASSWORD), timeout=10, verify=False)
-        return r.json().get("id")
-    except Exception as e:
-        log.error(f"Term create error '{name}': {e}")
-        return None
-
-def post_job_to_wordpress(job: dict) -> tuple:
-    h = _wp_auth_headers()
-    title       = sanitize_text(job.get("jobTitle", ""))
-    description = sanitize_text(job.get("jobDescription", ""))
-    if not title or not description:
-        return None, None
-
-    slug = re.sub(r"[^a-z0-9-]", "-", title.lower())[:80]
-    try:
-        r = requests.get(f"{WP_JOBS_URL}?slug={slug}", headers=h, timeout=10, verify=False)
-        posts = r.json()
-        if isinstance(posts, list) and posts:
-            log.info(f"⏭ Job already on WP: {title}")
-            return posts[0]["id"], posts[0].get("link")
-    except Exception:
-        pass
-
-    logo_url    = sanitize_text(job.get("companyLogo", ""), is_url=True)
-    location    = sanitize_text(job.get("jobLocation", ""))
-    raw_type    = sanitize_text(job.get("jobType", "Full-time"))
-    job_type_s  = JOB_TYPE_MAPPING.get(raw_type.lower().strip(), "full-time")
-    company     = sanitize_text(job.get("companyName", ""))
-    application = sanitize_text(job.get("application", ""), is_url=True)
-    deadline    = sanitize_text(job.get("deadline", "")) or sanitize_text(job.get("estimatedDeadline", ""))
-    co_website  = sanitize_text(job.get("companyWebsite", ""), is_url=True)
-    qualif      = sanitize_text(job.get("jobQualifications", ""))
-    experience  = sanitize_text(job.get("jobExperience", ""))
-    industry    = sanitize_text(job.get("companyIndustry", ""))
-    co_address  = sanitize_text(job.get("companyAddress", ""))
-    job_field   = sanitize_text(job.get("jobField", ""))
-    job_url_src = sanitize_text(job.get("jobUrl", ""), is_url=True)
-    co_founded  = sanitize_text(job.get("companyFounded", ""))
-    co_type     = sanitize_text(job.get("companyType", ""))
-    salary      = sanitize_text(job.get("salaryRange", ""))
-    about       = sanitize_text(job.get("companyDetails", ""))
-
-    is_email = bool(re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", application))
-    is_url_v = bool(re.match(r"^https?://[^\s]+$", application))
-    if not (is_email or is_url_v):
-        application = ""
-
-    # Upload logo
-    attachment_id = None
-    if logo_url:
-        try:
-            img_r = requests.get(logo_url, headers={"User-Agent": HEADERS["User-Agent"],
-                                                      "Referer": "https://www.linkedin.com/"}, timeout=15)
-            if img_r.status_code == 200:
-                ct  = img_r.headers.get("Content-Type", "image/jpeg")
-                ext = "png" if "png" in ct else "jpg"
-                fn  = re.sub(r"[^a-z0-9]", "-", company.lower()) + "-logo." + ext
-                up_h = dict(_wp_auth_headers())
-                up_h["Content-Disposition"] = f"attachment; filename={fn}"
-                up_h["Content-Type"] = ct
-                up_r = requests.post(WP_MEDIA_URL, headers=up_h, data=img_r.content,
-                                     auth=(WP_USER, WP_PASSWORD), timeout=20, verify=False)
-                if up_r.status_code in (200, 201):
-                    attachment_id = up_r.json().get("id")
-        except Exception as e:
-            log.warning(f"Logo upload failed: {e}")
-
-    region_term_id   = get_or_create_term(f"{WP_BASE}/job_listing_region", location)
-    job_type_term_id = get_or_create_term(f"{WP_BASE}/job_listing_type",
-                                           job_type_s.replace("-", " ").title())
-
-    # Generate tagline from company about
-    tagline = paraphrase_tagline(about[:300]) if about else ""
-
-    payload = {
-        "title":          title,
-        "content":        description,
-        "status":         "publish",
-        "featured_media": attachment_id or 0,
-        "meta": {
-            "_job_title":          title,
-            "_job_location":       location,
-            "_job_type":           job_type_s,
-            "_job_description":    description,
-            "_application":        application,
-            "_job_expires":        deadline,
-            "_company_name":       company,
-            "_company_website":    co_website,
-            "_company_logo":       str(attachment_id) if attachment_id else "",
-            "_company_industry":   industry,
-            "_company_address":    co_address,
-            "_company_founded":    co_founded,
-            "_company_type":       co_type,
-            "_company_tagline":    tagline,
-            "_company_details":    about,
-            "_job_qualifications": qualif,
-            "_job_experiences":    experience,
-            "_job_field":          job_field,
-            "_job_source_url":     job_url_src,
-            "_job_salary":         salary,
-        },
-    }
-    if region_term_id:   payload["job_listing_region"] = [region_term_id]
-    if job_type_term_id: payload["job_listing_type"]   = [job_type_term_id]
-
-    for attempt in range(3):
-        try:
-            r = requests.post(WP_JOBS_URL, json=payload, headers=h,
-                              auth=(WP_USER, WP_PASSWORD), timeout=20, verify=False)
-            r.raise_for_status()
-            post = r.json()
-            log.info(f"✅ Job posted: '{title}' → WP ID {post.get('id')}")
-            return post.get("id"), post.get("link")
-        except Exception as e:
-            log.error(f"Job post attempt {attempt+1} failed: {e}")
-            if attempt < 2: time.sleep(2 ** attempt)
-    return None, None
 
 # =============================================================================
 #  VERBOSE PRINTER
@@ -2126,22 +1849,22 @@ def print_job_verbose(job: dict, index: int, total: int):
     desc_indented = "\n".join("   " + line for line in desc_preview.splitlines() if line.strip())
     apply = job.get("application", "")
     logo  = job.get("companyLogo", "")
-    orig_title = job.get("originalTitle", "")
+    method = job.get("_apply_method", "")
     print()
     print(C_DIVIDER())
     print(C_HEADER(f"  JOB {index}/{total}"))
     print(C_DIVIDER())
-    print(f"  {C_LABEL('Title (original)')}  : {C_VALUE(orig_title)}")
-    print(f"  {C_LABEL('Title (paraphrased)')}: {C_GREEN(job.get('jobTitle',''))}")
-    print(f"  {C_LABEL('Job Type')}           : {job.get('jobType','')}")
-    print(f"  {C_LABEL('Field')}              : {job.get('jobField','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Location')}           : {job.get('jobLocation','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Seniority')}          : {job.get('jobExperience','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Qualifications')}     : {job.get('jobQualifications','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Salary')}             : {job.get('salaryRange','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Date Posted')}        : {job.get('datePosted','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Deadline')}           : {job.get('deadline','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Apply Link')}         : {C_GREEN(apply) if apply else C_DIM('— not found —')}")
+    print(f"  {C_LABEL('Title')}          : {C_VALUE(job.get('jobTitle',''))}")
+    print(f"  {C_LABEL('Job Type')}       : {job.get('jobType','')}")
+    print(f"  {C_LABEL('Field')}          : {job.get('jobField','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Location')}       : {job.get('jobLocation','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Seniority')}      : {job.get('jobExperience','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Qualifications')} : {job.get('jobQualifications','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Salary')}         : {job.get('salaryRange','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Date Posted')}    : {job.get('datePosted','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Deadline')}       : {job.get('deadline','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Apply Link')}     : {C_GREEN(apply) if apply else C_DIM('— not found —')}")
+    print(f"  {C_LABEL('Apply Method')}   : {C_DIM(method) if method else C_DIM('—')}")
     print()
     print(f"  {C_BLUE('── COMPANY ──────────────────────────────────────────────')}")
     print(f"  {C_LABEL('Name')}           : {C_VALUE(job.get('companyName','') or C_DIM('—'))}")
@@ -2150,20 +1873,21 @@ def print_job_verbose(job: dict, index: int, total: int):
     print(f"  {C_LABEL('Founded')}        : {job.get('companyFounded','') or C_DIM('—')}")
     print(f"  {C_LABEL('Headquarters')}   : {job.get('companyAddress','') or C_DIM('—')}")
     print(f"  {C_LABEL('Website')}        : {job.get('companyWebsite','') or C_DIM('—')}")
+    print(f"  {C_LABEL('LinkedIn URL')}   : {job.get('companyUrl','') or C_DIM('—')}")
     print(f"  {C_LABEL('Logo')}           : {logo if logo else C_DIM('— none —')}")
     about = job.get("companyDetails", "")
     if about:
         preview = (about[:200] + " [...]") if len(about) > 200 else about
         print(f"  {C_LABEL('About')}          : {preview}")
     print()
-    print(f"  {C_BLUE('── DESCRIPTION PREVIEW (paraphrased) ───────────────────')}")
+    print(f"  {C_BLUE('── DESCRIPTION PREVIEW ──────────────────────────────────')}")
     print(desc_indented if desc_indented else C_DIM("   — no description —"))
     print()
     print(f"  {C_LABEL('Job URL')}        : {C_DIM(job.get('jobUrl',''))}")
     print(C_DIVIDER())
 
 # =============================================================================
-#  URL COLLECTION — GUEST API  (unchanged)
+#  URL COLLECTION — GUEST API
 # =============================================================================
 
 def _build_guest_api_url(keyword: str, start: int) -> str:
@@ -2185,9 +1909,9 @@ def _collect_job_urls_from_cards(html: str, seen: set) -> list:
         if not href.startswith("http"): href = "https://www.linkedin.com" + href
         c = canonicalise_job_url(href)
         if c and c not in seen: seen.add(c); found.append(c)
-    for sel in ["a.base-card__full-link","a.base-main-card__full-link",
+    for sel in ["a.base-card__full-link", "a.base-main-card__full-link",
                 "a[data-tracking-control-name='public_jobs_jserp-name_click']",
-                "a.job-card-list__title","a.job-card-container__link"]:
+                "a.job-card-list__title", "a.job-card-container__link"]:
         for tag in soup.select(sel):
             href = tag.get("href", "")
             if "/jobs/view/" not in href: continue
@@ -2243,7 +1967,7 @@ def _paginate_keyword(keyword: str, seen: set) -> list:
     return urls
 
 # =============================================================================
-#  EXCEL SAVE  (includes original title/desc columns for audit)
+#  EXCEL SAVE
 # =============================================================================
 
 def _save_excel(jobs: list):
@@ -2251,7 +1975,7 @@ def _save_excel(jobs: list):
     ws = wb.active
     ws.title = SHEET_NAME
     headers = [
-        "Job Title","Original Title","Job Type","Job Qualifications","Job Experience",
+        "Job Title","Job Type","Job Qualifications","Job Experience",
         "Job Location","Job Field","Date Posted","Deadline",
         "Job Description","Application","Company URL","Company Name",
         "Company Logo","Company Industry","Company Founded","Company Type",
@@ -2261,29 +1985,12 @@ def _save_excel(jobs: list):
     ws.append(headers)
     for job in jobs:
         ws.append([
-            job["jobTitle"],
-            job.get("originalTitle",""),
-            job["jobType"],
-            job["jobQualifications"],
-            job["jobExperience"],
-            job["jobLocation"],
-            job["jobField"],
-            job["datePosted"],
-            job["deadline"],
-            job["jobDescription"],
-            job["application"],
-            job["companyUrl"],
-            job["companyName"],
-            job["companyLogo"],
-            job["companyIndustry"],
-            job["companyFounded"],
-            job["companyType"],
-            job["companyWebsite"],
-            job["companyAddress"],
-            job["companyDetails"],
-            job["jobUrl"],
-            job["estimatedDeadline"],
-            job["salaryRange"],
+            job["jobTitle"],job["jobType"],job["jobQualifications"],job["jobExperience"],
+            job["jobLocation"],job["jobField"],job["datePosted"],job["deadline"],
+            job["jobDescription"],job["application"],job["companyUrl"],job["companyName"],
+            job["companyLogo"],job["companyIndustry"],job["companyFounded"],job["companyType"],
+            job["companyWebsite"],job["companyAddress"],job["companyDetails"],job["jobUrl"],
+            job["estimatedDeadline"],job["salaryRange"],
         ])
     wb.save(OUTPUT_FILE)
     log.info(f"Saved {len(jobs)} rows → {OUTPUT_FILE}")
@@ -2294,22 +2001,15 @@ def _save_excel(jobs: list):
 
 def craw():
     start_time = time.time()
-    _init_tracker()
-
     print()
     print(C_HEADER("=" * 72))
-    print(C_HEADER("  LINKEDIN JOB SCRAPER v4 + MISTRAL PARAPHRASE"))
+    print(C_HEADER("  LINKEDIN JOB SCRAPER v5 — Saudi Arabia"))
     print(C_HEADER("=" * 72))
-    print(f"  Keywords      : {len(SEARCH_KEYWORDS)}")
-    print(f"  Max pages     : {'unlimited' if not MAX_PAGES else MAX_PAGES} per keyword")
-    print(f"  Job cap       : {'none' if not JOB_LIMIT else JOB_LIMIT}")
-    print(f"  Paraphrase    : {'✅ enabled' if ENABLE_PARAPHRASE else '❌ disabled'}")
-    print(f"  NLP available : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
-    print(f"  Started       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Keywords    : {len(SEARCH_KEYWORDS)}")
+    print(f"  Max pages   : {'unlimited' if not MAX_PAGES else MAX_PAGES} per keyword")
+    print(f"  Job cap     : {'none' if not JOB_LIMIT else JOB_LIMIT}")
+    print(f"  Started     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(C_HEADER("=" * 72))
-
-    processed_ids, processed_urls = load_processed_ids()
-    print(f"  Tracker loaded: {len(processed_ids)} previously processed job IDs\n")
 
     seen_urls = set(); all_job_urls = []; seen_content = set()
 
@@ -2335,29 +2035,21 @@ def craw():
         print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(all_job_urls)} ...')}")
         log.info(f"URL: {url}")
         try:
-            job = scrape_job_details(url, processed_ids, processed_urls)
+            job = scrape_job_details(url)
             if job and job.get("jobTitle"):
-                fp = ((job.get("originalTitle") or "").lower().strip(),
-                      (job.get("companyName")   or "").lower().strip(),
-                      (job.get("jobLocation")   or "").lower().strip())
+                fp = (
+                    (job.get("jobTitle") or "").lower().strip(),
+                    (job.get("companyName") or "").lower().strip(),
+                    (job.get("jobLocation") or "").lower().strip(),
+                )
                 if fp in seen_content:
-                    print(C_DIM(f"  ⧳  Duplicate content — skipped"))
+                    print(C_DIM(f"  ⧳  Duplicate — skipped ({job['jobTitle']} @ {job.get('companyName','')})"))
                 else:
                     seen_content.add(fp)
                     jobs.append(job)
                     print_job_verbose(job, j+1, len(all_job_urls))
-
-                    # Post to WordPress
-                    print(C_BLUE(f"\n  📤 Posting to WordPress …"))
-                    wp_id, wp_url = post_job_to_wordpress(job)
-                    if wp_id:
-                        mark_posted(job["_jobId"], wp_id, wp_url or "")
-                        print(C_GREEN(f"  ✅ WP ID={wp_id}  🔗 {wp_url}"))
-                    else:
-                        mark_failed(job["_jobId"], "wp_post_failed")
-                        print(C_RED("  ❌ WordPress post failed"))
             else:
-                print(C_RED("  ✗  No title found / skipped"))
+                print(C_RED("  ✗  No title found — skipped"))
         except Exception as e:
             errors += 1
             print(C_RED(f"  ✗  ERROR: {e}"))
@@ -2378,15 +2070,17 @@ def craw():
     print(f"  {C_LABEL('Errors')}         : {C_RED(str(errors)) if errors else '0'}")
     print(f"  {C_LABEL('Duration')}       : ~{mins} min")
     print(f"  {C_LABEL('Output file')}    : {OUTPUT_FILE}")
-    print(f"  {C_LABEL('Tracker file')}   : {PROCESSED_IDS_FILE}")
 
     if jobs:
         from collections import Counter
+
+        # ── Jobs by field ─────────────────────────────────────────────────────
         fields = Counter(j.get("jobField") or "Unknown" for j in jobs)
         print(f"\n  {C_LABEL('Jobs by field:')}")
         for field, count in fields.most_common():
             print(f"    {field:<35} {'█'*min(count,40)} {count}")
 
+        # ── Application link breakdown ────────────────────────────────────────
         with_apply = sum(1 for j in jobs if j.get("application"))
         with_email = sum(1 for j in jobs if "@" in (j.get("application") or ""))
         with_url   = with_apply - with_email
@@ -2396,19 +2090,26 @@ def craw():
         print(f"    Email found  : {with_email}")
         print(f"    Not found    : {no_apply}")
 
-        fill_fields = ["companyName","companyIndustry","companyLogo",
-                       "companyWebsite","companyAddress","companyFounded","companyDetails"]
+        # ── v5 apply method breakdown ─────────────────────────────────────────
+        methods = Counter(j.get("_apply_method", "unknown") for j in jobs)
+        print(f"\n  {C_LABEL('Apply method breakdown (v5):')}")
+        for method, count in methods.most_common():
+            print(f"    {method:<35} {count}")
+
+        # ── Company fill-rate ─────────────────────────────────────────────────
+        fields_to_check = [
+            "companyName","companyIndustry","companyLogo",
+            "companyWebsite","companyAddress","companyFounded","companyDetails",
+        ]
         print(f"\n  {C_LABEL('Company field fill-rate:')}")
-        for f in fill_fields:
+        for f in fields_to_check:
             filled = sum(1 for j in jobs if j.get(f))
             pct = round(filled / len(jobs) * 100) if jobs else 0
             print(f"    {f:<25} {filled}/{len(jobs)} ({pct}%)")
-
-        para_count = sum(1 for j in jobs if j.get("jobTitle") != j.get("originalTitle"))
-        print(f"\n  {C_LABEL('Paraphrased titles')} : {para_count}/{len(jobs)}")
 
     print(C_HEADER("=" * 72))
 
 
 if __name__ == "__main__":
     craw()
+Done
