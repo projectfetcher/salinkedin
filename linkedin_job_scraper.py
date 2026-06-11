@@ -2015,12 +2015,6 @@ def _save_excel(jobs: list):
         ])
 
     wb.save(OUTPUT_FILE)
-    log.info(f"Saved {len(jobs)} rows to {OUTPUT_FILE}")
+    log.info(f"Saved {len(jobs)} rows to {OUTPUT_FILE}")if __name__ == "__main__":
+    craw()
 
-
-if __name__ == "__main__":
-   
-
-
-Written: 2022 lines
-Done
