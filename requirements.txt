@@ -1,0 +1,4 @@
+requests==2.33.1
+beautifulsoup4==4.14.3
+openpyxl==3.1.5
+lxml==5.3.0
