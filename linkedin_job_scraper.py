@@ -2019,7 +2019,7 @@ def _save_excel(jobs: list):
 
 
 if __name__ == "__main__":
-    craw()
+   
 
 
 Written: 2022 lines
