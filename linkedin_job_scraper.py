@@ -63,11 +63,11 @@ WP_PASSWORD = "st8a 6mWY wqgV 0syR mB3i y5FQ"
 
 SEARCH_KEYWORDS = [
     "",
-    "engineer", "developer", "manager", "finance", "sales", "HR",
-    "doctor", "construction", "logistics", "operations", "customer service",
-    "teacher", "chef", "lawyer", "graphic designer", "production manager",
-    "petroleum", "driver", "security", "researcher", "journalist",
-    "banker", "retail", "renewable energy",
+   # "engineer", "developer", "manager", "finance", "sales", "HR",
+  #  "doctor", "construction", "logistics", "operations", "customer service",
+  #  "teacher", "chef", "lawyer", "graphic designer", "production manager",
+  #  "petroleum", "driver", "security", "researcher", "journalist",
+  #  "banker", "retail", "renewable energy",
 ]
 
 # =============================================================================
