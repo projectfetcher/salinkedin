@@ -1,37 +1,47 @@
 """
-LinkedIn Job Scraper — Python v5 + Mistral Paraphrase
-======================================================
-Merges:
-  • v5 scraper  — smarter deep-crawl, ATS redirect chains, site_info passed
-                  into extract_application_details, richer company-data harvest
-  • Paraphrase  — Mistral-powered rewrite of title / description / company about
-                  + tagline; duplicate tracker (CSV); WordPress posting
+LinkedIn Job Scraper — v6 (Robust Company-Website Crawl + Mistral Paraphrase)
+==============================================================================
+Key improvements over v5+paraphrase merged:
 
-Key differences vs plain v5 / plain paraphrase:
-  ─ ALL v5 crawling improvements included (see v5 changelog below)
-  ─ site_info is passed to extract_application_details (v5 priority-6 email)
-  ─ LinkedIn URLs are ALWAYS blanked in application + companyUrl + companyWebsite
-    before saving to Excel or posting to WordPress
-  ─ Duplicate tracker (processed_jobs.csv) carries over from paraphrase version
-  ─ WordPress posting uses paraphrased title + description + tagline
+  COMPANY WEBSITE CRAWLING (v6)
+  ─ crawl_company_website_deep   : expanded career-page discovery with 25+
+                                   common path probes, richer link scoring,
+                                   context-aware job matching, ATS redirect
+                                   following, per-request timeouts
+  ─ scrape_about_contact_footer  : wider sub-page set, richer patterns,
+                                   structured-data extraction (Schema.org),
+                                   20 s time-box
+  ─ harvest_company_logo_from_website : dedicated logo extractor —
+                                   tries og:image, twitter:image, <link
+                                   rel="icon">, SVG logos, img tags with
+                                   "logo" in class/alt/src, manifest.json
+  ─ harvest_missing_company_info : single orchestrating call that fills
+                                   any still-empty company fields from the
+                                   company website (industry, address,
+                                   founded, about, logo, social links)
 
-v5 crawl improvements (vs v4):
-  ─ crawl_company_website_deep   — smarter careers discovery, context-aware
-                                   job matching, ATS redirect-chain following,
-                                   per-request timeouts, method tags
-  ─ scrape_about_contact_footer  — more sub-pages, richer patterns, 15 s time-box
-  ─ extract_application_details  — site_info email at step 5 (before v3 fallback)
-  ─ scrape_job_details           — phone appended to companyDetails
+  LINKEDIN URL FILTERING
+  ─ ALL LinkedIn URLs are blanked in application / companyUrl / companyWebsite
+    before saving or posting
+
+  DUPLICATE TRACKER
+  ─ processed_jobs.csv carries over; job_id is MD5 of canonical URL
+
+  WORDPRESS POSTING
+  ─ Uses paraphrased title + description + tagline
+
+  COLUMN STANDARD  (matches your spec exactly)
+  Job Title | Job Type | Job Qualifications | Job Experience | Job Location
+  Job Field | Date Posted | Deadline | Job Description | Application
+  Company URL | Company Name | Company Logo | Company Industry
+  Company Founded | Company Type | Company Website | Company Address
+  Company Details | Job URL | Estimated Deadline | Salary Range
 
 Requirements:
     pip install requests beautifulsoup4 openpyxl pandas sentence-transformers language-tool-python
 
 Usage:
-    python linkedin_job_scraper_v5_paraphrase.py
-
-Outputs:
-    jobs_output.xlsx      — scraped + paraphrased jobs
-    processed_jobs.csv    — duplicate / status tracker
+    python linkedin_job_scraper_v6.py
 """
 
 import re
@@ -42,7 +52,7 @@ import hashlib
 import logging
 import os
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, unquote, quote_plus
+from urllib.parse import urlparse, unquote, quote_plus, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -97,10 +107,6 @@ ENABLE_PARAPHRASE = True   # set False to skip paraphrasing entirely
 SEARCH_KEYWORDS = [
     "",
    # "engineer", "developer", "manager", "finance", "sales", "HR",
-   # "doctor", "construction", "logistics", "operations", "customer service",
-   # "teacher", "chef", "lawyer", "graphic designer", "production manager",
-   # "petroleum", "driver", "security", "researcher", "journalist",
-   # "banker", "retail", "renewable energy",
 ]
 
 # =============================================================================
@@ -177,7 +183,6 @@ NOISE_EMAIL_DOMAINS = [
     "schema.org","wixpress.com","squarespace.com",
 ]
 
-# Known ATS domains — always valid apply URLs
 ATS_DOMAINS = [
     "greenhouse.io","lever.co","workday.com","bamboohr.com",
     "smartrecruiters.com","taleo.net","icims.com","jazzhr.com",
@@ -186,6 +191,9 @@ ATS_DOMAINS = [
     "comeet.com","rippling.com","gusto.com","ats.com",
     "myworkdayjobs.com","ultipro.com","successfactors.com",
     "oraclecloudhq.com","careers-page.com","applytojob.com",
+    "recruitcrm.io","hirehive.com","manatal.com","zohorecruit.com",
+    "freshteam.com","jobsoid.com","recruitee.com","recooty.com",
+    "hrmantra.com","darwinbox.com","keka.com","springrecruit.com",
 ]
 
 FAKE_LOCAL_RE  = re.compile(
@@ -209,17 +217,15 @@ JOB_TYPE_MAPPING = {
 }
 
 # =============================================================================
-#  ▶▶ LINKEDIN URL FILTER  (new in merged version)
+#  LINKEDIN URL FILTER
 # =============================================================================
 
 def is_linkedin_url(value: str) -> bool:
-    """Return True if the value is a LinkedIn URL (any subdomain)."""
     if not value:
         return False
     return bool(re.search(r"linkedin\.com", value, re.I))
 
 def blank_if_linkedin(value: str) -> str:
-    """Return empty string if value contains a LinkedIn URL, else return as-is."""
     return "" if is_linkedin_url(value) else value
 
 # =============================================================================
@@ -666,7 +672,9 @@ def is_career_url(url: str) -> bool:
     return any(k in l for k in [
         "career","jobs","apply","vacanci","recruit","opening",
         "hiring","work-with","join-us","join_us","opportunities",
-        "current-opening","job-listing","positions",
+        "current-opening","job-listing","positions","employment",
+        "work-for-us","work_for_us","workforus","joinus","join_us",
+        "job-board","jobboard","our-team/join","staffing","talent",
     ])
 
 def is_contact_url(url: str) -> bool:
@@ -727,7 +735,7 @@ def _title_similarity(a: str, b: str) -> float:
     if not ta or not tb: return 0.0
     return len(ta & tb) / max(len(ta), len(tb))
 
-def _follow_redirect_chain(url: str, max_hops: int = 4) -> str:
+def _follow_redirect_chain(url: str, max_hops: int = 6) -> str:
     """Follow up to max_hops HTTP redirects for ATS redirect chains."""
     current = url
     for _ in range(max_hops):
@@ -918,7 +926,6 @@ def clean_email(raw: str) -> str:
 def clean_application_link(raw: str) -> str:
     if not raw: return ""
     raw = raw.strip()
-    # ── Block LinkedIn URLs in application links ──────────────────────────────
     if is_linkedin_url(raw):
         log.info(f"Blanking LinkedIn application URL: {raw}")
         return ""
@@ -1205,33 +1212,262 @@ def extract_company_from_job_page(html: str, soup: BeautifulSoup) -> dict:
     return result
 
 # =============================================================================
-#  v5: DEEP COMPANY WEBSITE CRAWLER
+#  v6: HARVEST COMPANY LOGO FROM WEBSITE  (new)
 # =============================================================================
+
+def harvest_company_logo_from_website(website_url: str, company_name: str = "") -> str:
+    """
+    Dedicated logo harvester for the company's own website.
+    Priority order:
+      1. og:image / twitter:image meta tags (often high-quality brand images)
+      2. <link rel="apple-touch-icon"> (high-res, square)
+      3. JSON-LD Organization logo
+      4. <img> tags where src/alt/class contains "logo"
+      5. SVG logo elements
+      6. <link rel="icon"> favicon as absolute last resort
+      7. /favicon.png, /logo.png, /logo.svg probes
+    Returns a usable absolute URL or "".
+    """
+    if not website_url or should_skip_crawl(website_url):
+        return ""
+
+    root = website_url.rstrip("/")
+    log.info(f"Harvesting logo from: {root}")
+
+    try:
+        time.sleep(0.5)
+        r = requests.get(root, headers=_next_headers(), timeout=12, allow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        html = r.text[:FETCH_CHAR_LIMIT]
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception as e:
+        log.debug(f"Logo harvest fetch error: {e}")
+        return ""
+
+    def _abs(href: str) -> str:
+        if not href: return ""
+        href = href.strip()
+        if href.startswith("http"): return href
+        if href.startswith("//"): return "https:" + href
+        if href.startswith("/"): return root + href
+        return ""
+
+    def _is_valid_logo(url: str) -> bool:
+        if not url or not url.startswith("http"): return False
+        low = url.lower()
+        # Skip tiny favicons, data URIs, placeholders
+        if "data:" in low: return False
+        if any(skip in low for skip in ["placeholder","default","blank","missing","ghost"]): return False
+        return True
+
+    # 1. og:image / twitter:image
+    for prop in ["og:image", "twitter:image", "og:logo"]:
+        tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+        if tag:
+            url = _abs(tag.get("content", ""))
+            if _is_valid_logo(url):
+                log.info(f"Logo from {prop}: {url}")
+                return url
+
+    # 2. apple-touch-icon (usually 180x180 or higher)
+    for rel in ["apple-touch-icon", "apple-touch-icon-precomposed"]:
+        tag = soup.find("link", rel=rel)
+        if tag:
+            url = _abs(tag.get("href", ""))
+            if _is_valid_logo(url):
+                log.info(f"Logo from apple-touch-icon: {url}")
+                return url
+
+    # 3. JSON-LD Organization logo
+    ld = _parse_jsonld(html)
+    if ld.get("company_logo"):
+        url = clean_logo_url(ld["company_logo"])
+        if _is_valid_logo(url):
+            log.info(f"Logo from JSON-LD: {url}")
+            return url
+
+    # 4. <img> tags where src/alt/class suggests logo
+    LOGO_PATTERNS = re.compile(r"\blogo\b", re.I)
+    for img in soup.find_all("img"):
+        src   = _abs(img.get("src", "") or img.get("data-src", "") or img.get("data-lazy-src", ""))
+        alt   = img.get("alt", "")
+        cls   = " ".join(img.get("class", []))
+        imgid = img.get("id", "")
+        if (LOGO_PATTERNS.search(src) or LOGO_PATTERNS.search(alt) or
+                LOGO_PATTERNS.search(cls) or LOGO_PATTERNS.search(imgid)):
+            if _is_valid_logo(src):
+                log.info(f"Logo from img[logo]: {src}")
+                return src
+    # Also try header img as fallback
+    header = soup.find("header") or soup.select_one("nav, #header, .header, .navbar")
+    if header:
+        for img in header.find_all("img"):
+            src = _abs(img.get("src", "") or img.get("data-src", ""))
+            if _is_valid_logo(src):
+                log.info(f"Logo from header img: {src}")
+                return src
+
+    # 5. SVG logo in header/nav
+    for svg_wrapper in soup.select("header svg, nav svg, .logo svg, #logo svg"):
+        # Get parent container's href if wrapped in <a>
+        parent = svg_wrapper.parent
+        if parent and parent.name == "a":
+            href = _abs(parent.get("href", ""))
+            if href and href == root:
+                # The SVG is probably the site logo but we can't use it as URL
+                pass
+        # Try to find nearby img instead
+        sibling_img = svg_wrapper.find_next_sibling("img") or svg_wrapper.find_previous_sibling("img")
+        if sibling_img:
+            src = _abs(sibling_img.get("src", ""))
+            if _is_valid_logo(src):
+                return src
+
+    # 6. Probe common logo paths
+    common_paths = [
+        "/logo.png", "/logo.svg", "/logo.jpg", "/logo.webp",
+        "/images/logo.png", "/images/logo.svg", "/img/logo.png",
+        "/assets/logo.png", "/assets/images/logo.png",
+        "/static/logo.png", "/media/logo.png",
+        f"/images/{re.sub(r'[^a-z0-9]', '-', company_name.lower())}-logo.png" if company_name else "",
+    ]
+    for path in common_paths:
+        if not path: continue
+        probe_url = root + path
+        try:
+            pr = requests.head(probe_url, headers=_next_headers(), timeout=5, allow_redirects=True)
+            if pr.status_code == 200:
+                ct = pr.headers.get("Content-Type", "")
+                if "image" in ct or path.endswith((".png",".svg",".jpg",".webp")):
+                    log.info(f"Logo from path probe: {probe_url}")
+                    return probe_url
+        except Exception:
+            pass
+
+    # 7. Favicon as absolute last resort (not great quality but better than nothing)
+    for rel in ["icon", "shortcut icon"]:
+        tag = soup.find("link", rel=lambda r: r and rel in (r if isinstance(r, list) else [r]))
+        if not tag:
+            tag = soup.find("link", attrs={"rel": rel})
+        if tag:
+            url = _abs(tag.get("href", ""))
+            if url and url.startswith("http") and not url.endswith(".ico"):
+                log.info(f"Logo from favicon link: {url}")
+                return url
+
+    log.info(f"No logo found at {root}")
+    return ""
+
+# =============================================================================
+#  v6: HARVEST MISSING COMPANY INFO FROM WEBSITE  (new orchestrator)
+# =============================================================================
+
+def harvest_missing_company_info(
+    website_url: str,
+    company_name: str = "",
+    existing: dict | None = None,
+) -> dict:
+    """
+    Single orchestrating call.  Fills any fields still empty in `existing`
+    by scraping the company website (home, about, contact pages).
+
+    Returns a merged dict with keys:
+      logo, industry, address, founded, about, social_links, phone, email
+    """
+    existing = existing or {}
+    result = {
+        "logo":         existing.get("logo", ""),
+        "industry":     existing.get("industry", ""),
+        "address":      existing.get("address", ""),
+        "founded":      existing.get("founded", ""),
+        "about":        existing.get("about", ""),
+        "social_links": existing.get("social_links", ""),
+        "phone":        existing.get("phone", ""),
+        "email":        existing.get("email", ""),
+    }
+
+    if not website_url or should_skip_crawl(website_url):
+        return result
+
+    # Logo — dedicated harvester
+    if not result["logo"]:
+        result["logo"] = harvest_company_logo_from_website(website_url, company_name)
+
+    # Everything else — about/contact/footer scrape
+    missing_fields = [k for k in ["industry","address","founded","about","social_links","phone","email"]
+                      if not result[k]]
+    if missing_fields:
+        site_info = scrape_about_contact_footer(website_url)
+        for field in missing_fields:
+            if site_info.get(field):
+                result[field] = site_info[field]
+
+    return result
+
+# =============================================================================
+#  v6: DEEP COMPANY WEBSITE CRAWLER  (heavily expanded)
+# =============================================================================
+
+# Expanded set of career-page path probes (v6)
+CAREER_PATH_PROBES = [
+    "/careers", "/jobs", "/job-openings", "/vacancies", "/work-with-us",
+    "/join-us", "/opportunities", "/careers/open-positions", "/about/careers",
+    "/employment", "/job-listings", "/job-board", "/jobboard", "/hiring",
+    "/talent", "/open-roles", "/roles", "/positions", "/current-openings",
+    "/we-are-hiring", "/work-here", "/join-our-team", "/join-the-team",
+    "/careers/jobs", "/about-us/careers", "/company/careers",
+    "/work/jobs", "/jobs/open", "/jobs/current", "/jobs/all",
+    "/career-opportunities", "/employment-opportunities",
+    "/apply", "/apply-now", "/apply-online",
+    "/hr/jobs", "/hr/careers", "/human-resources/careers",
+    "/staffing", "/recruiting", "/recruitment",
+]
+
+CAREER_TEXT_RE = re.compile(
+    r"career|job|vacanc|opportunit|recruit|hiring|join\s*us|work\s*with\s*us|"
+    r"open\s*positions?|current\s*openings?|we['']?re\s+hiring|employment|"
+    r"join\s*our\s*team|work\s*here|open\s*roles?|browse\s*jobs?|"
+    r"view\s*jobs?|all\s*jobs?|available\s*positions?|apply\s*now", re.I
+)
+
+APPLY_TEXT_RE = re.compile(
+    r"apply\s*now|apply\s*online|apply\s*for\s+this|apply\s*here|"
+    r"submit\s*(your\s*)?(application|cv|resume)|send\s*(cv|resume|application)|"
+    r"click\s*to\s*apply|start\s*application|quick\s*apply|easy\s*apply|"
+    r"apply\s*today|apply\s*via|submit\s*now|send\s*application", re.I
+)
+APPLY_CLASS_RE = re.compile(
+    r"apply|btn[-_]?apply|cta[-_]?apply|job[-_]?apply|application[-_]?btn|"
+    r"apply-btn|apply-link|apply-job|application-link", re.I
+)
+
 
 def crawl_company_website_deep(website_url: str, job_title: str) -> dict:
     """
-    Multi-layer apply-URL hunter (v5):
-      1. Fetch company home page
-      2. Discover careers/jobs page via link text + URL patterns + HEAD probes
-      3. Fuzzy-match job title in anchor text AND surrounding context
-      4. Find the real Apply button; follow ATS redirect chains; detect mailto:
-      5. Fall back gracefully at each layer
+    Multi-layer apply-URL hunter (v6):
+      1. Fetch company home page; discover careers link via text + URL patterns
+      2. Probe 40+ common career page paths with HEAD requests
+      3. Fuzzy-match job title in anchor text AND surrounding context (wider net)
+      4. Find real Apply button; follow ATS redirect chains; detect mailto:
+      5. Scan for forms with apply-related actions
+      6. Fall back gracefully at each layer
     Returns: {"apply_url": str, "email": str, "method": str}
     """
     result = {"apply_url": "", "email": "", "method": ""}
     if not website_url or should_skip_crawl(website_url):
         return result
 
-    deadline    = time.time() + 20
+    deadline    = time.time() + 30   # v6: extended to 30s
     root        = website_url.rstrip("/")
     parsed_root = urlparse(root)
     root_domain = parsed_root.netloc
 
-    def _get(url: str):
+    def _get(url: str, timeout: int = 12):
         if time.time() > deadline: return None, None
         try:
-            time.sleep(0.6)
-            r = requests.get(url, headers=_next_headers(), timeout=12, allow_redirects=True)
+            time.sleep(0.5)
+            r = requests.get(url, headers=_next_headers(), timeout=timeout, allow_redirects=True)
             if r.status_code != 200: return None, None
             html = r.text[:FETCH_CHAR_LIMIT]
             return html, BeautifulSoup(html, "html.parser")
@@ -1244,11 +1480,14 @@ def crawl_company_website_deep(website_url: str, job_title: str) -> dict:
         for tag in soup.find_all("a", href=True):
             href = make_absolute(tag.get("href", ""), base)
             if not href or not href.startswith("http"): continue
-            if root_domain not in urlparse(href).netloc: continue
+            h_domain = urlparse(href).netloc
+            # Accept same domain OR subdomains (e.g. careers.company.com)
+            if root_domain not in h_domain and not h_domain.endswith("." + root_domain):
+                continue
             out.append((href, tag.get_text(strip=True).lower()))
         return out
 
-    # STEP 1 — Home page
+    # ── STEP 1: Home page ─────────────────────────────────────────────────────
     home_html, home_soup = _get(root)
     if not home_html:
         log.info(f"deep crawl: could not fetch home page {root}")
@@ -1256,87 +1495,130 @@ def crawl_company_website_deep(website_url: str, job_title: str) -> dict:
 
     home_links = _same_domain_links(home_soup, root)
 
-    # STEP 2 — Find the careers page
-    CAREER_TEXT_RE = re.compile(
-        r"career|job|vacanc|opportunit|recruit|hiring|join\s*us|work\s*with\s*us|"
-        r"open\s*positions?|current\s*openings?|we['']?re\s+hiring", re.I)
+    # ── STEP 2: Find careers page ─────────────────────────────────────────────
+    careers_candidates = []
 
-    careers_url = ""
+    # From home page links — score each candidate
     for href, txt in home_links:
-        if CAREER_TEXT_RE.search(txt) or is_career_url(href):
-            careers_url = href
-            log.info(f"deep crawl: careers page from home link → {careers_url}")
-            break
+        score = 0
+        if CAREER_TEXT_RE.search(txt):  score += 3
+        if is_career_url(href):          score += 3
+        if score > 0:
+            careers_candidates.append((score, href))
 
-    if not careers_url:
-        for path in ["/careers","/jobs","/job-openings","/vacancies",
-                     "/work-with-us","/join-us","/opportunities",
-                     "/careers/open-positions","/about/careers"]:
+    # Sort by score descending
+    careers_candidates.sort(key=lambda x: -x[0])
+    careers_url = careers_candidates[0][1] if careers_candidates else ""
+
+    if careers_url:
+        log.info(f"deep crawl: careers page from home link → {careers_url} (score={careers_candidates[0][0]})")
+
+    # HEAD-probe additional paths if we didn't find a careers page yet
+    if not careers_url or careers_candidates[0][0] < 3:
+        log.info("deep crawl: probing common career paths...")
+        for path in CAREER_PATH_PROBES:
             if time.time() > deadline: break
             candidate = root + path
             try:
-                r = requests.head(candidate, headers=_next_headers(),
-                                  timeout=6, allow_redirects=True)
-                if r.status_code == 200:
-                    careers_url = candidate
-                    log.info(f"deep crawl: careers page from HEAD probe → {careers_url}")
-                    break
+                pr = requests.head(candidate, headers=_next_headers(),
+                                   timeout=6, allow_redirects=True)
+                if pr.status_code == 200:
+                    # Validate it's actually an HTML page (not a redirect to home)
+                    final_url = pr.url if hasattr(pr, "url") else candidate
+                    if root_domain in urlparse(final_url).netloc:
+                        new_score = 5  # direct path match = high confidence
+                        careers_candidates.append((new_score, candidate))
+                        if not careers_url:
+                            careers_url = candidate
+                            log.info(f"deep crawl: careers page from HEAD probe → {careers_url}")
+                        break
             except Exception:
                 pass
 
+    # Also look for ATS-hosted careers pages linked from home
+    if not careers_url:
+        for href, txt in home_links:
+            if is_ats_url(href) and ("career" in txt or "job" in txt or "apply" in txt):
+                careers_url = href
+                log.info(f"deep crawl: ATS careers page from home → {careers_url}")
+                break
+
     if not careers_url:
         log.info(f"deep crawl: no careers page found at {root}")
+        # Still try to get email from home page
+        em = scan_page_for_email(home_soup, home_html)
+        if em:
+            return {"apply_url": "", "email": em, "method": "deep_home_email"}
         return result
 
-    # STEP 3 — Find the specific job listing on the careers page
+    # ── STEP 3: Scrape careers page & find specific job ───────────────────────
     careers_html, careers_soup = _get(careers_url)
     if not careers_soup: return result
 
-    career_links          = _same_domain_links(careers_soup, careers_url)
-    best_url, best_score  = "", 0.0
+    career_links         = _same_domain_links(careers_soup, careers_url)
+    # Also add ATS external links from careers page
+    for tag in careers_soup.find_all("a", href=True):
+        href = tag.get("href", "")
+        if href.startswith("http") and is_ats_url(href):
+            career_links.append((href, tag.get_text(strip=True).lower()))
+
+    best_url, best_score = "", 0.0
 
     for href, anchor_txt in career_links:
         if any(skip in href.lower() for skip in ["#","login","sign-in","signup",
-                                                   "register","privacy","terms"]):
+                                                   "register","privacy","terms",
+                                                   "cookie","policy"]):
             continue
+        # Score: anchor text similarity
         score = _title_similarity(job_title, anchor_txt)
+
+        # Also score context around the link on the page
         for tag in careers_soup.find_all("a", href=True):
             abs_href = make_absolute(tag.get("href", ""), careers_url)
             if abs_href != href: continue
+            # Check grandparent container for richer context
             parent = tag.parent
             if parent:
                 context_txt = parent.get_text(separator=" ", strip=True).lower()
                 ctx_score   = _title_similarity(job_title, context_txt)
                 score       = max(score, ctx_score * 0.85)
+            gp = parent.parent if parent else None
+            if gp:
+                gp_txt  = gp.get_text(separator=" ", strip=True).lower()
+                gp_score = _title_similarity(job_title, gp_txt)
+                score   = max(score, gp_score * 0.70)
             break
+
         if score > best_score:
             best_score, best_url = score, href
 
     email_from_careers = scan_page_for_email(careers_soup, careers_html)
 
-    if best_score < 0.30:
+    # Lower threshold slightly to catch more matches (v6: 0.25 vs v5: 0.30)
+    if best_score < 0.25:
         log.info(f"deep crawl: no close title match (best={best_score:.2f}) on careers page")
         if email_from_careers:
             return {"apply_url": "", "email": email_from_careers,
                     "method": "deep_careers_email"}
+        # Return the careers page itself as a useful fallback
         return {"apply_url": careers_url, "email": "", "method": "deep_careers_page"}
 
     log.info(f"deep crawl: matched '{job_title}' → {best_url}  (score={best_score:.2f})")
 
-    # STEP 4 — Job detail page: find the real Apply button
+    # If it's an ATS URL, follow redirects immediately
+    if is_ats_url(best_url):
+        resolved = _follow_redirect_chain(best_url)
+        if resolved and not is_bad_url(resolved):
+            return {"apply_url": resolved, "email": "", "method": "deep_ats_direct"}
+
+    # ── STEP 4: Job detail page — find the real Apply button ──────────────────
     job_html, job_soup = _get(best_url)
     if not job_soup:
         return {"apply_url": best_url, "email": "", "method": "deep_job_page_url"}
 
-    APPLY_TEXT_RE  = re.compile(
-        r"apply\s*now|apply\s*online|apply\s*for\s+this|apply\s*here|"
-        r"submit\s*(your\s*)?(application|cv|resume)|send\s*(cv|resume|application)|"
-        r"click\s*to\s*apply|start\s*application", re.I)
-    APPLY_CLASS_RE = re.compile(
-        r"apply|btn[-_]?apply|cta[-_]?apply|job[-_]?apply|application[-_]?btn", re.I)
-
     apply_url = ""
 
+    # 4a. <a> tags with apply-related text or class
     for tag in job_soup.find_all("a", href=True):
         tag_text = tag.get_text(strip=True)
         tag_cls  = " ".join(tag.get("class", []))
@@ -1354,21 +1636,32 @@ def crawl_company_website_deep(website_url: str, job_title: str) -> dict:
                 log.info(f"deep crawl: apply button found → {apply_url}")
                 break
 
+    # 4b. <button> tags with data-href / data-url
     if not apply_url:
         for btn in job_soup.find_all("button"):
             if APPLY_TEXT_RE.search(btn.get_text(strip=True)):
-                data_href = btn.get("data-href", "") or btn.get("data-url", "")
+                data_href = (btn.get("data-href", "") or btn.get("data-url", "") or
+                             btn.get("onclick", ""))
                 if data_href:
-                    href = make_absolute(data_href, best_url)
+                    # Try to extract URL from onclick="window.open('url',...)"
+                    url_match = re.search(r"['\"]?(https?://[^\s'\"]+)['\"]?", data_href)
+                    if url_match:
+                        href = url_match.group(1)
+                    else:
+                        href = make_absolute(data_href, best_url)
                     if href and not is_bad_url(href):
                         apply_url = href; break
 
+    # 4c. Forms with apply-related action
     if not apply_url:
         for form in job_soup.find_all("form"):
             action = make_absolute(form.get("action", ""), best_url)
-            if action and not is_bad_url(action) and "apply" in action.lower():
-                apply_url = action; break
+            if action and not is_bad_url(action):
+                form_text = form.get_text(separator=" ").lower()
+                if "apply" in action.lower() or APPLY_TEXT_RE.search(form_text):
+                    apply_url = action; break
 
+    # 4d. ATS links anywhere on job page
     if not apply_url:
         for tag in job_soup.find_all("a", href=True):
             href = make_absolute(tag.get("href", ""), best_url)
@@ -1377,6 +1670,7 @@ def crawl_company_website_deep(website_url: str, job_title: str) -> dict:
                 log.info(f"deep crawl: ATS link found on job page → {apply_url}")
                 break
 
+    # 4e. Email on job page
     if not apply_url:
         em = scan_page_for_email(job_soup, job_html)
         if em:
@@ -1388,27 +1682,27 @@ def crawl_company_website_deep(website_url: str, job_title: str) -> dict:
     return {"apply_url": best_url, "email": "", "method": "deep_job_page_url"}
 
 # =============================================================================
-#  v5: ABOUT / CONTACT / FOOTER SCRAPER
+#  v6: ABOUT / CONTACT / FOOTER SCRAPER  (expanded)
 # =============================================================================
 
 def scrape_about_contact_footer(website_url: str) -> dict:
     """
-    Visit home, about, and contact pages to harvest missing company details.
-    Returns: address, phone, email, founded, description, social_links
+    Visit home, about, contact, and team pages to harvest company details.
+    Returns: address, phone, email, founded, description, social_links, industry
     """
-    empty = {"address": "", "phone": "", "email": "",
-             "founded": "", "description": "", "social_links": ""}
+    empty = {"address": "", "phone": "", "email": "", "founded": "",
+             "description": "", "social_links": "", "industry": ""}
     if not website_url or should_skip_crawl(website_url): return empty
 
     root        = website_url.rstrip("/")
     parsed_root = urlparse(root)
     root_domain = parsed_root.netloc
-    deadline    = time.time() + 15
+    deadline    = time.time() + 20   # v6: extended to 20s
 
     def _get(url: str):
         if time.time() > deadline: return None, None
         try:
-            time.sleep(0.5)
+            time.sleep(0.4)
             r = requests.get(url, headers=_next_headers(), timeout=12, allow_redirects=True)
             if r.status_code != 200: return None, None
             html = r.text[:FETCH_CHAR_LIMIT]
@@ -1422,28 +1716,32 @@ def scrape_about_contact_footer(website_url: str) -> dict:
     def _harvest(soup: BeautifulSoup, html: str):
         full_text = soup.get_text(" ", strip=True)
 
+        # Email
         if not result["email"]:
             em = scan_page_for_email(soup, html)
             if em: result["email"] = em
 
+        # Phone
         if not result["phone"]:
             ph_patterns = [
                 r"\+\d[\d\s\-().]{7,18}\d",
                 r"\b0\d[\d\s\-().]{6,14}\d",
                 r"\(\d{2,4}\)\s*\d{3,4}[\s\-]\d{3,4}",
+                r"\b\d{2,4}[\s.\-]\d{3,4}[\s.\-]\d{3,4}\b",
             ]
             for pat in ph_patterns:
                 ph_m = re.search(pat, full_text)
                 if ph_m:
                     candidate = ph_m.group(0).strip()
-                    digits    = re.sub(r"\D", "", candidate)
+                    digits = re.sub(r"\D", "", candidate)
                     if 7 <= len(digits) <= 15:
                         result["phone"] = candidate; break
 
+        # Address — structured data first
         if not result["address"]:
             for el in soup.select(
                 "[itemprop='address'],[itemprop='streetAddress'],"
-                "[itemtype*='PostalAddress']"
+                "[itemtype*='PostalAddress'],[class*='address'],[id*='address']"
             ):
                 t = el.get_text(separator=", ", strip=True)
                 if len(t) > 10:
@@ -1453,43 +1751,63 @@ def scrape_about_contact_footer(website_url: str) -> dict:
                     r"\d+[\w\s,.\-]{5,120}"
                     r"(?:street|st\b|avenue|ave\b|road|rd\b|boulevard|blvd|"
                     r"lane|ln\b|drive|dr\b|way\b|close|court|building|floor|"
-                    r"suite|tower|plaza|district|zone|p\.?\s*o\.?\s*box|"
-                    r"riyadh|jeddah|dammam|khobar|mecca|madinah|"
-                    r"dubai|abu dhabi|doha|kuwait|bahrain)",
+                    r"suite|tower|plaza|district|zone|p\.?\s*o\.?\s*box)",
                     full_text, re.I)
                 if addr_m:
                     result["address"] = addr_m.group(0).strip()[:250]
 
+        # Founded year
         if not result["founded"]:
             fy = re.search(
                 r"(?:founded|established|incorporated|since|est\.?)\s*[:\-]?\s*((?:19|20)\d{2})",
                 full_text, re.I)
             if fy: result["founded"] = fy.group(1)
 
+        # Industry — look for keywords near "industry" label
+        if not result["industry"]:
+            ind_m = re.search(
+                r"(?:industry|sector|field)[:\s]+([A-Za-z &/\-]{3,60}?)(?:\.|,|\n|$)",
+                full_text, re.I)
+            if ind_m:
+                result["industry"] = ind_m.group(1).strip()[:80]
+            if not result["industry"]:
+                # Schema.org itemprop
+                for el in soup.select("[itemprop='industry'],[itemprop='knowsAbout']"):
+                    t = el.get_text(strip=True)
+                    if t: result["industry"] = t[:80]; break
+
+        # Description
         if not result["description"]:
-            og = (soup.find("meta", property="og:description") or
-                  soup.find("meta", attrs={"name": "description"}))
-            if og:
-                desc = og.get("content", "").strip()
-                if len(desc) > 40:
-                    result["description"] = desc[:600]
+            # og/twitter meta description
+            for prop in ["og:description", "description", "twitter:description"]:
+                og = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+                if og:
+                    desc = og.get("content", "").strip()
+                    if len(desc) > 40:
+                        result["description"] = desc[:600]; break
             if not result["description"]:
+                # Longest paragraph on the page
+                best_p, best_len = "", 0
                 for p in soup.find_all("p"):
                     t = p.get_text(strip=True)
-                    if len(t) > 80:
-                        result["description"] = t[:600]; break
+                    if len(t) > best_len and not re.search(r"cookie|privacy|terms", t, re.I):
+                        best_len, best_p = len(t), t
+                if best_len > 80:
+                    result["description"] = best_p[:600]
 
+        # Social links
         if not result["social_links"]:
             socials = []
             for a in soup.find_all("a", href=True):
-                href = a["href"].lower()
+                href = a["href"]
                 for platform in ["twitter.com","x.com","facebook.com","instagram.com",
                                   "linkedin.com","youtube.com","tiktok.com"]:
-                    if platform in href and a["href"] not in socials:
-                        socials.append(a["href"]); break
+                    if platform in href.lower() and href not in socials:
+                        socials.append(href); break
             if socials:
                 result["social_links"] = ", ".join(socials[:5])
 
+    # Home page
     home_html, home_soup = _get(root)
     if home_soup:
         footer = (home_soup.find("footer") or
@@ -1498,6 +1816,7 @@ def scrape_about_contact_footer(website_url: str) -> dict:
             _harvest(BeautifulSoup(str(footer), "html.parser"), str(footer))
         _harvest(home_soup, home_html)
 
+        # Discover sub-pages
         about_url = contact_url = ""
         for tag in home_soup.find_all("a", href=True):
             href = make_absolute(tag.get("href", ""), root)
@@ -1509,22 +1828,25 @@ def scrape_about_contact_footer(website_url: str) -> dict:
                 contact_url = href
             if about_url and contact_url: break
 
+        # HEAD-probe common paths
         if not about_url and time.time() < deadline:
-            for path in ["/about","/about-us","/our-story","/company","/who-we-are"]:
+            for path in ["/about","/about-us","/our-story","/company","/who-we-are",
+                         "/overview","/mission","/about/company"]:
                 try:
-                    r = requests.head(root + path, headers=_next_headers(),
-                                      timeout=5, allow_redirects=True)
-                    if r.status_code == 200:
+                    pr = requests.head(root + path, headers=_next_headers(),
+                                       timeout=5, allow_redirects=True)
+                    if pr.status_code == 200:
                         about_url = root + path; break
                 except Exception:
                     pass
 
         if not contact_url and time.time() < deadline:
-            for path in ["/contact","/contact-us","/reach-us","/get-in-touch"]:
+            for path in ["/contact","/contact-us","/reach-us","/get-in-touch",
+                         "/connect","/enquiry","/enquiries"]:
                 try:
-                    r = requests.head(root + path, headers=_next_headers(),
-                                      timeout=5, allow_redirects=True)
-                    if r.status_code == 200:
+                    pr = requests.head(root + path, headers=_next_headers(),
+                                       timeout=5, allow_redirects=True)
+                    if pr.status_code == 200:
                         contact_url = root + path; break
                 except Exception:
                     pass
@@ -1612,7 +1934,6 @@ def scrape_company_details(company_url: str) -> dict:
     ws_tag  = soup.select_one("a[data-tracking-control-name='about_website']")
     raw_ws  = (ws_tag.get("href", "") if ws_tag else "") or _get_detail("Website") or ld.get("company_website", "")
     website = decode_linkedin_apply_url(raw_ws) or raw_ws
-    # Blank if still LinkedIn
     website = blank_if_linkedin(website)
 
     name = (ld.get("company_name", "") or _sel("h1.org-top-card-summary__title", "h1", "title") or "")
@@ -1649,7 +1970,10 @@ def upload_logo_to_wordpress(logo_url: str, company_name: str) -> str:
                                              "Referer": "https://www.linkedin.com/"}, timeout=15)
         if r.status_code != 200: return ""
         ct  = r.headers.get("Content-Type", "image/jpeg")
-        ext = "png" if "png" in ct else "jpg"
+        if "svg" in ct: ext = "svg"
+        elif "png" in ct: ext = "png"
+        elif "webp" in ct: ext = "webp"
+        else: ext = "jpg"
         fn  = re.sub(r"[^a-z0-9]", "-", company_name.lower()) + "-logo." + ext
         creds = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
         wr    = requests.post(WP_URL + "media",
@@ -1714,7 +2038,7 @@ def crawl_company_website(website_url: str, job_title: str) -> dict:
     return {"url": root_url, "email": "", "method": "fallback_website"}
 
 # =============================================================================
-#  APPLICATION DETAILS EXTRACTOR  (v5 priority chain)
+#  APPLICATION DETAILS EXTRACTOR  (v6 priority chain)
 # =============================================================================
 
 def extract_application_details(
@@ -1730,7 +2054,7 @@ def extract_application_details(
       0  JSON-LD apply URL
       1  LinkedIn "Apply" button on the job page
       2  Script tags on the job page
-      3  v5 deep crawl: home → careers → job listing → Apply button
+      3  v6 deep crawl: home → careers → job listing → Apply button
       4  Links / URLs in the job description
       5  Email from site_info (about/contact/footer scrape)
       6  v3 company website fallback crawl
@@ -1759,7 +2083,8 @@ def extract_application_details(
     for script in soup.find_all("script"):
         txt = script.string or ""
         for pat in [r'"applyStartUrl"\s*:\s*"([^"]+)"',
-                    r'"applicationUrl"\s*:\s*"([^"]+)"']:
+                    r'"applicationUrl"\s*:\s*"([^"]+)"',
+                    r'"applyUrl"\s*:\s*"([^"]+)"']:
             m = re.search(pat, txt)
             if m:
                 cand = decode_html_entities(m.group(1)).replace("\\", "")
@@ -1770,7 +2095,7 @@ def extract_application_details(
 
     # ── 3. Deep crawl company website ────────────────────────────────────────
     if company_website and not should_skip_crawl(company_website):
-        log.info(f"v5 deep crawl starting: {company_website} for '{job_title}'")
+        log.info(f"v6 deep crawl starting: {company_website} for '{job_title}'")
         deep = crawl_company_website_deep(company_website, job_title)
         if deep.get("email"):
             log.info(f"apply found via deep crawl (email): {deep['email']}")
@@ -2041,12 +2366,12 @@ def extract_experience(text: str) -> str:
     return ""
 
 # =============================================================================
-#  JOB DETAIL SCRAPER  (v5 + paraphrase)
+#  JOB DETAIL SCRAPER  (v6 + paraphrase)
 # =============================================================================
 
 def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) -> dict | None:
     """
-    Scrape a single LinkedIn job (v5 layers) then paraphrase key fields.
+    Scrape a single LinkedIn job (v6 layers) then paraphrase key fields.
     Returns the job dict or None.
     """
     job_id = make_job_id(job_url)
@@ -2082,7 +2407,7 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     )
     company_url_el = (soup.select_one(".topcard__org-name-link") or
                       soup.select_one(".job-details-jobs-unified-top-card__company-name a"))
-    # companyUrl is always a LinkedIn URL — we will blank it before output
+    # companyUrl is a LinkedIn URL — blanked before output
     company_url_raw = company_url_el.get("href", "") if company_url_el else ""
 
     location       = sel_text(".topcard__flavor--bullet",
@@ -2125,7 +2450,7 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     time.sleep(0.5)
     company = scrape_company_details(company_url_raw)
 
-    # ── LAYER 3: merge ────────────────────────────────────────────────────────
+    # ── LAYER 3: merge fields ─────────────────────────────────────────────────
     def _first(*vals) -> str:
         for v in vals:
             if v and str(v).strip(): return str(v).strip()
@@ -2143,27 +2468,47 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     # Ensure merged_website is not a LinkedIn URL
     merged_website = blank_if_linkedin(merged_website)
 
-    # ── LAYER 4: deep company website crawl ──────────────────────────────────
+    # ── LAYER 4: v6 harvest from company website ──────────────────────────────
     site_info: dict = {}
     if merged_website and not should_skip_crawl(merged_website):
-        log.info(f"v5 about/contact/footer crawl: {merged_website}")
-        site_info = scrape_about_contact_footer(merged_website)
+        log.info(f"v6 harvesting missing info from: {merged_website}")
 
-        if not merged_hq      and site_info.get("address"):
-            merged_hq = site_info["address"]
-        if not merged_founded and site_info.get("founded"):
-            merged_founded = site_info["founded"]
-        if not merged_about   and site_info.get("description"):
-            merged_about = site_info["description"]
+        existing_info = {
+            "logo":     merged_logo,
+            "industry": merged_industry,
+            "address":  merged_hq,
+            "founded":  merged_founded,
+            "about":    merged_about,
+        }
+        harvested = harvest_missing_company_info(merged_website, merged_name, existing_info)
 
-        if site_info.get("phone"):
-            phone_note = f"Phone: {site_info['phone']}"
+        # Fill any gaps from website harvest
+        if not merged_logo    and harvested.get("logo"):
+            merged_logo    = harvested["logo"]
+        if not merged_industry and harvested.get("industry"):
+            merged_industry = harvested["industry"]
+        if not merged_hq      and harvested.get("address"):
+            merged_hq      = harvested["address"]
+        if not merged_founded and harvested.get("founded"):
+            merged_founded = harvested["founded"]
+        if not merged_about   and harvested.get("about"):
+            merged_about   = harvested["about"]
+
+        # site_info carries email/phone for apply chain
+        site_info = {
+            "email": harvested.get("email", ""),
+            "phone": harvested.get("phone", ""),
+        }
+
+        # Append phone to about if not already there
+        if harvested.get("phone"):
+            phone_note = f"Phone: {harvested['phone']}"
             if phone_note not in (merged_about or ""):
                 merged_about = (merged_about + "\n" + phone_note).strip() if merged_about else phone_note
 
     job_field = linkedin_function or merged_industry or infer_job_field(title, description)
 
-    # ── LAYER 5: application details (v5 deep crawl + all fallbacks) ─────────
+    # ── LAYER 5: application details (v6 deep crawl + all fallbacks) ─────────
     time.sleep(0.2)
     apply_data = extract_application_details(
         job_url, soup, merged_website, ld,
@@ -2179,14 +2524,20 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     apply_link = clean_application_link(raw_apply)
 
     # Final safety net — blank any remaining LinkedIn URLs
-    apply_link     = blank_if_linkedin(apply_link)
+    apply_link      = blank_if_linkedin(apply_link)
     company_url_out = blank_if_linkedin(company_url_raw)
 
     qualifications = extract_qualification(description)
     experience     = extract_experience(description)
 
+    # ── LAYER 6: try to upload logo to WordPress (from website, not LinkedIn) ─
+    if merged_logo and WP_USER:
+        hosted = upload_logo_to_wordpress(merged_logo, merged_name)
+        if hosted:
+            merged_logo = hosted
+
     # ─────────────────────────────────────────────────────────────────────────
-    #  ▶▶ PARAPHRASE
+    #  PARAPHRASE
     # ─────────────────────────────────────────────────────────────────────────
     mark_scraped(job_id, job_url, title, merged_name)
     processed_ids.add(job_id)
@@ -2206,36 +2557,42 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     else:
         print(C_DIM("  ⚠️  Paraphrasing skipped (ENABLE_PARAPHRASE=False or no API key)"))
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Return using EXACT column-name standard:
+    #  Job Title | Job Type | Job Qualifications | Job Experience | Job Location
+    #  Job Field | Date Posted | Deadline | Job Description | Application
+    #  Company URL | Company Name | Company Logo | Company Industry
+    #  Company Founded | Company Type | Company Website | Company Address
+    #  Company Details | Job URL | Estimated Deadline | Salary Range
+    # ─────────────────────────────────────────────────────────────────────────
     return {
-        # Paraphrased fields
-        "jobTitle":          paraphrased_title,
-        "jobDescription":    paraphrased_desc,
-        "companyDetails":    paraphrased_about,
-        # Original fields (for audit / duplicate detection)
-        "originalTitle":     title,
-        "originalDesc":      description,
-        # Structured fields
-        "jobType":           job_type,
-        "jobQualifications": qualifications,
-        "jobExperience":     experience,
-        "jobLocation":       location,
-        "jobField":          job_field,
-        "datePosted":        posted_date,
-        "deadline":          effective_deadline,
-        "application":       apply_link,          # LinkedIn URLs already blanked
-        "companyUrl":        company_url_out,      # LinkedIn URLs already blanked
-        "companyName":       merged_name,
-        "companyLogo":       clean_logo_url(merged_logo),
-        "companyIndustry":   merged_industry,
-        "companyFounded":    merged_founded,
-        "companyType":       merged_type,
-        "companyWebsite":    merged_website,       # LinkedIn URLs already blanked
-        "companyAddress":    merged_hq,
-        "jobUrl":            job_url,              # kept for internal reference only
-        "estimatedDeadline": estimated_deadline,
-        "salaryRange":       salary,
-        "_jobId":            job_id,
-        "_apply_method":     apply_data.get("method", ""),
+        "Job Title":          paraphrased_title,
+        "Job Type":           job_type,
+        "Job Qualifications": qualifications,
+        "Job Experience":     experience,
+        "Job Location":       location,
+        "Job Field":          job_field,
+        "Date Posted":        posted_date,
+        "Deadline":           effective_deadline,
+        "Job Description":    paraphrased_desc,
+        "Application":        apply_link,
+        "Company URL":        company_url_out,   # LinkedIn URL — blanked
+        "Company Name":       merged_name,
+        "Company Logo":       clean_logo_url(merged_logo),
+        "Company Industry":   merged_industry,
+        "Company Founded":    merged_founded,
+        "Company Type":       merged_type,
+        "Company Website":    merged_website,    # LinkedIn URL — blanked
+        "Company Address":    merged_hq,
+        "Company Details":    paraphrased_about,
+        "Job URL":            job_url,           # kept for audit only
+        "Estimated Deadline": estimated_deadline,
+        "Salary Range":       salary,
+        # Internal fields — NOT in Excel output
+        "_originalTitle":     title,
+        "_originalDesc":      description,
+        "_jobId":             job_id,
+        "_apply_method":      apply_data.get("method", ""),
     }
 
 # =============================================================================
@@ -2268,8 +2625,8 @@ def get_or_create_term(taxonomy_url: str, name: str) -> int | None:
 def post_job_to_wordpress(job: dict) -> tuple:
     h = _wp_auth_headers()
 
-    title       = sanitize_text(job.get("jobTitle", ""))
-    description = sanitize_text(job.get("jobDescription", ""))
+    title       = sanitize_text(job.get("Job Title", ""))
+    description = sanitize_text(job.get("Job Description", ""))
     if not title or not description:
         return None, None
 
@@ -2283,27 +2640,25 @@ def post_job_to_wordpress(job: dict) -> tuple:
     except Exception:
         pass
 
-    # All URL fields already have LinkedIn blanked at scrape time
-    logo_url    = sanitize_text(job.get("companyLogo", ""), is_url=True)
-    location    = sanitize_text(job.get("jobLocation", ""))
-    raw_type    = sanitize_text(job.get("jobType", "Full-time"))
+    logo_url    = sanitize_text(job.get("Company Logo", ""), is_url=True)
+    location    = sanitize_text(job.get("Job Location", ""))
+    raw_type    = sanitize_text(job.get("Job Type", "Full-time"))
     job_type_s  = JOB_TYPE_MAPPING.get(raw_type.lower().strip(), "full-time")
-    company     = sanitize_text(job.get("companyName", ""))
-    application = sanitize_text(job.get("application", ""), is_url=True)
-    deadline    = sanitize_text(job.get("deadline", "")) or sanitize_text(job.get("estimatedDeadline", ""))
-    co_website  = sanitize_text(job.get("companyWebsite", ""), is_url=True)
-    qualif      = sanitize_text(job.get("jobQualifications", ""))
-    experience  = sanitize_text(job.get("jobExperience", ""))
-    industry    = sanitize_text(job.get("companyIndustry", ""))
-    co_address  = sanitize_text(job.get("companyAddress", ""))
-    job_field   = sanitize_text(job.get("jobField", ""))
-    # jobUrl is kept for internal audit only — NOT sent to WordPress
-    co_founded  = sanitize_text(job.get("companyFounded", ""))
-    co_type     = sanitize_text(job.get("companyType", ""))
-    salary      = sanitize_text(job.get("salaryRange", ""))
-    about       = sanitize_text(job.get("companyDetails", ""))
+    company     = sanitize_text(job.get("Company Name", ""))
+    application = sanitize_text(job.get("Application", ""), is_url=True)
+    deadline    = sanitize_text(job.get("Deadline", "")) or sanitize_text(job.get("Estimated Deadline", ""))
+    co_website  = sanitize_text(job.get("Company Website", ""), is_url=True)
+    qualif      = sanitize_text(job.get("Job Qualifications", ""))
+    experience  = sanitize_text(job.get("Job Experience", ""))
+    industry    = sanitize_text(job.get("Company Industry", ""))
+    co_address  = sanitize_text(job.get("Company Address", ""))
+    job_field   = sanitize_text(job.get("Job Field", ""))
+    co_founded  = sanitize_text(job.get("Company Founded", ""))
+    co_type     = sanitize_text(job.get("Company Type", ""))
+    salary      = sanitize_text(job.get("Salary Range", ""))
+    about       = sanitize_text(job.get("Company Details", ""))
 
-    # Extra safety check before posting
+    # Extra safety check
     application = blank_if_linkedin(application)
     co_website  = blank_if_linkedin(co_website)
 
@@ -2314,13 +2669,18 @@ def post_job_to_wordpress(job: dict) -> tuple:
 
     # Upload logo
     attachment_id = None
+    if logo_url and not logo_url.startswith("http"):
+        logo_url = ""
     if logo_url:
         try:
             img_r = requests.get(logo_url, headers={"User-Agent": HEADERS["User-Agent"],
                                                       "Referer": "https://www.linkedin.com/"}, timeout=15)
             if img_r.status_code == 200:
                 ct  = img_r.headers.get("Content-Type", "image/jpeg")
-                ext = "png" if "png" in ct else "jpg"
+                if "svg" in ct: ext = "svg"
+                elif "png" in ct: ext = "png"
+                elif "webp" in ct: ext = "webp"
+                else: ext = "jpg"
                 fn  = re.sub(r"[^a-z0-9]", "-", company.lower()) + "-logo." + ext
                 up_h = dict(_wp_auth_headers())
                 up_h["Content-Disposition"] = f"attachment; filename={fn}"
@@ -2362,7 +2722,6 @@ def post_job_to_wordpress(job: dict) -> tuple:
             "_job_qualifications": qualif,
             "_job_experiences":    experience,
             "_job_field":          job_field,
-            # _job_source_url intentionally omitted — no LinkedIn refs on WP
             "_job_salary":         salary,
         },
     }
@@ -2387,40 +2746,40 @@ def post_job_to_wordpress(job: dict) -> tuple:
 # =============================================================================
 
 def print_job_verbose(job: dict, index: int, total: int):
-    desc         = job.get("jobDescription", "")
+    desc         = job.get("Job Description", "")
     desc_preview = (desc[:400] + " [...]") if len(desc) > 400 else desc
     desc_indented = "\n".join("   " + line for line in desc_preview.splitlines() if line.strip())
-    apply        = job.get("application", "")
-    logo         = job.get("companyLogo", "")
-    orig_title   = job.get("originalTitle", "")
+    apply        = job.get("Application", "")
+    logo         = job.get("Company Logo", "")
+    orig_title   = job.get("_originalTitle", "")
     method       = job.get("_apply_method", "")
     print()
     print(C_DIVIDER())
     print(C_HEADER(f"  JOB {index}/{total}"))
     print(C_DIVIDER())
     print(f"  {C_LABEL('Title (original)')}   : {C_VALUE(orig_title)}")
-    print(f"  {C_LABEL('Title (paraphrased)')}: {C_GREEN(job.get('jobTitle',''))}")
-    print(f"  {C_LABEL('Job Type')}            : {job.get('jobType','')}")
-    print(f"  {C_LABEL('Field')}               : {job.get('jobField','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Location')}            : {job.get('jobLocation','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Seniority')}           : {job.get('jobExperience','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Qualifications')}      : {job.get('jobQualifications','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Salary')}              : {job.get('salaryRange','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Date Posted')}         : {job.get('datePosted','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Deadline')}            : {job.get('deadline','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Title (paraphrased)')}: {C_GREEN(job.get('Job Title',''))}")
+    print(f"  {C_LABEL('Job Type')}            : {job.get('Job Type','')}")
+    print(f"  {C_LABEL('Field')}               : {job.get('Job Field','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Location')}            : {job.get('Job Location','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Seniority')}           : {job.get('Job Experience','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Qualifications')}      : {job.get('Job Qualifications','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Salary')}              : {job.get('Salary Range','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Date Posted')}         : {job.get('Date Posted','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Deadline')}            : {job.get('Deadline','') or C_DIM('—')}")
     print(f"  {C_LABEL('Apply Link')}          : {C_GREEN(apply) if apply else C_DIM('— not found / blanked —')}")
     print(f"  {C_LABEL('Apply Method')}        : {C_DIM(method) if method else C_DIM('—')}")
     print()
     print(f"  {C_BLUE('── COMPANY ──────────────────────────────────────────────')}")
-    print(f"  {C_LABEL('Name')}           : {C_VALUE(job.get('companyName','') or C_DIM('—'))}")
-    print(f"  {C_LABEL('Industry')}       : {job.get('companyIndustry','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Type')}           : {job.get('companyType','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Founded')}        : {job.get('companyFounded','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Headquarters')}   : {job.get('companyAddress','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Website')}        : {job.get('companyWebsite','') or C_DIM('—')}")
-    print(f"  {C_LABEL('LinkedIn URL')}   : {C_DIM('(blanked — not stored)')}")
+    print(f"  {C_LABEL('Name')}           : {C_VALUE(job.get('Company Name','') or C_DIM('—'))}")
+    print(f"  {C_LABEL('Industry')}       : {job.get('Company Industry','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Type')}           : {job.get('Company Type','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Founded')}        : {job.get('Company Founded','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Headquarters')}   : {job.get('Company Address','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Website')}        : {job.get('Company Website','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Company URL')}    : {C_DIM('(blanked — not stored)')}")
     print(f"  {C_LABEL('Logo')}           : {logo if logo else C_DIM('— none —')}")
-    about = job.get("companyDetails", "")
+    about = job.get("Company Details", "")
     if about:
         preview = (about[:200] + " [...]") if len(about) > 200 else about
         print(f"  {C_LABEL('About')}          : {preview}")
@@ -2510,48 +2869,42 @@ def _paginate_keyword(keyword: str, seen: set) -> list:
     return urls
 
 # =============================================================================
-#  EXCEL SAVE
+#  EXCEL SAVE  — exact column standard
 # =============================================================================
+
+# Exact column order as specified
+EXCEL_COLUMNS = [
+    "Job Title",
+    "Job Type",
+    "Job Qualifications",
+    "Job Experience",
+    "Job Location",
+    "Job Field",
+    "Date Posted",
+    "Deadline",
+    "Job Description",
+    "Application",
+    "Company URL",
+    "Company Name",
+    "Company Logo",
+    "Company Industry",
+    "Company Founded",
+    "Company Type",
+    "Company Website",
+    "Company Address",
+    "Company Details",
+    "Job URL",
+    "Estimated Deadline",
+    "Salary Range",
+]
 
 def _save_excel(jobs: list):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = SHEET_NAME
-    headers = [
-        "Job Title","Original Title","Job Type","Job Qualifications","Job Experience",
-        "Job Location","Job Field","Date Posted","Deadline",
-        "Job Description","Application","Company Name",
-        "Company Logo","Company Industry","Company Founded","Company Type",
-        "Company Website","Company Address","Company Details","Job URL",
-        "Estimated Deadline","Salary Range",
-        # NOTE: "Company URL" (LinkedIn) is intentionally excluded from Excel output
-    ]
-    ws.append(headers)
+    ws.append(EXCEL_COLUMNS)
     for job in jobs:
-        ws.append([
-            job["jobTitle"],
-            job.get("originalTitle", ""),
-            job["jobType"],
-            job["jobQualifications"],
-            job["jobExperience"],
-            job["jobLocation"],
-            job["jobField"],
-            job["datePosted"],
-            job["deadline"],
-            job["jobDescription"],
-            job["application"],
-            job["companyName"],
-            job["companyLogo"],
-            job["companyIndustry"],
-            job["companyFounded"],
-            job["companyType"],
-            job["companyWebsite"],
-            job["companyAddress"],
-            job["companyDetails"],
-            job["jobUrl"],          # source URL kept for audit only
-            job["estimatedDeadline"],
-            job["salaryRange"],
-        ])
+        ws.append([job.get(col, "") for col in EXCEL_COLUMNS])
     wb.save(OUTPUT_FILE)
     log.info(f"Saved {len(jobs)} rows → {OUTPUT_FILE}")
 
@@ -2565,13 +2918,14 @@ def craw():
 
     print()
     print(C_HEADER("=" * 72))
-    print(C_HEADER("  LINKEDIN JOB SCRAPER v5 + MISTRAL PARAPHRASE"))
+    print(C_HEADER("  LINKEDIN JOB SCRAPER v6 + MISTRAL PARAPHRASE"))
     print(C_HEADER("=" * 72))
     print(f"  Keywords      : {len(SEARCH_KEYWORDS)}")
     print(f"  Max pages     : {'unlimited' if not MAX_PAGES else MAX_PAGES} per keyword")
     print(f"  Job cap       : {'none' if not JOB_LIMIT else JOB_LIMIT}")
     print(f"  Paraphrase    : {'✅ enabled' if ENABLE_PARAPHRASE else '❌ disabled'}")
-    print(f"  LinkedIn URLs : ❌ BLOCKED (blanked in application / companyUrl / companyWebsite)")
+    print(f"  Logo source   : ✅ Company website (fallback from LinkedIn)")
+    print(f"  LinkedIn URLs : ❌ BLOCKED (blanked in Application / Company URL / Company Website)")
     print(f"  NLP available : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
     print(f"  Started       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(C_HEADER("=" * 72))
@@ -2604,11 +2958,11 @@ def craw():
         log.info(f"URL: {url}")
         try:
             job = scrape_job_details(url, processed_ids, processed_urls)
-            if job and job.get("jobTitle"):
+            if job and job.get("Job Title"):
                 fp = (
-                    (job.get("originalTitle") or "").lower().strip(),
-                    (job.get("companyName")   or "").lower().strip(),
-                    (job.get("jobLocation")   or "").lower().strip(),
+                    (job.get("_originalTitle") or "").lower().strip(),
+                    (job.get("Company Name")   or "").lower().strip(),
+                    (job.get("Job Location")   or "").lower().strip(),
                 )
                 if fp in seen_content:
                     print(C_DIM(f"  ⧳  Duplicate content — skipped"))
@@ -2652,13 +3006,13 @@ def craw():
     if jobs:
         from collections import Counter
 
-        fields = Counter(j.get("jobField") or "Unknown" for j in jobs)
+        fields = Counter(j.get("Job Field") or "Unknown" for j in jobs)
         print(f"\n  {C_LABEL('Jobs by field:')}")
         for field, count in fields.most_common():
             print(f"    {field:<35} {'█'*min(count,40)} {count}")
 
-        with_apply = sum(1 for j in jobs if j.get("application"))
-        with_email = sum(1 for j in jobs if "@" in (j.get("application") or ""))
+        with_apply = sum(1 for j in jobs if j.get("Application"))
+        with_email = sum(1 for j in jobs if "@" in (j.get("Application") or ""))
         with_url   = with_apply - with_email
         no_apply   = len(jobs) - with_apply
         print(f"\n  {C_LABEL('Application links:')}")
@@ -2667,20 +3021,26 @@ def craw():
         print(f"    Not found    : {no_apply}")
 
         methods = Counter(j.get("_apply_method", "unknown") for j in jobs)
-        print(f"\n  {C_LABEL('Apply method breakdown (v5):')}")
+        print(f"\n  {C_LABEL('Apply method breakdown (v6):')}")
         for method, count in methods.most_common():
             print(f"    {method:<35} {count}")
 
-        fill_fields = ["companyName","companyIndustry","companyLogo",
-                       "companyWebsite","companyAddress","companyFounded","companyDetails"]
+        fill_fields = ["Company Name","Company Industry","Company Logo",
+                       "Company Website","Company Address","Company Founded","Company Details"]
         print(f"\n  {C_LABEL('Company field fill-rate:')}")
         for f in fill_fields:
             filled = sum(1 for j in jobs if j.get(f))
             pct    = round(filled / len(jobs) * 100) if jobs else 0
             print(f"    {f:<25} {filled}/{len(jobs)} ({pct}%)")
 
-        para_count = sum(1 for j in jobs if j.get("jobTitle") != j.get("originalTitle"))
-        print(f"\n  {C_LABEL('Paraphrased titles')} : {para_count}/{len(jobs)}")
+        logo_from_website = sum(
+            1 for j in jobs
+            if j.get("Company Logo") and "linkedin" not in j.get("Company Logo","").lower()
+        )
+        print(f"\n  {C_LABEL('Logos from company website')} : {logo_from_website}/{len(jobs)}")
+
+        para_count = sum(1 for j in jobs if j.get("Job Title") != j.get("_originalTitle"))
+        print(f"  {C_LABEL('Paraphrased titles')}        : {para_count}/{len(jobs)}")
 
     print(C_HEADER("=" * 72))
 
