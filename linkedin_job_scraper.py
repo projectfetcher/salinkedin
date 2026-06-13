@@ -1,6 +1,26 @@
 """
-LinkedIn Job Scraper — Python v6 + Mistral Paraphrase
+LinkedIn Job Scraper — Python v7 + Mistral Paraphrase
 ======================================================
+v7 changes vs v6:
+  • sanitize_text() no longer strips Arabic text (added \\u0600-\\u06FF /
+    \\u0750-\\u077F ranges) so Arabic-language job descriptions are kept
+    intact instead of being reduced to stray punctuation.
+  • Added language detection: if a job description is mostly Arabic with
+    little usable Latin content, paraphrasing is skipped for that job and
+    "_lang": "ar" is recorded so it can be reviewed separately.
+  • Added is_bad_company_name() and extended is_placeholder_logo() to catch
+    LinkedIn login-wall artifacts ("Sign in", "LinkedIn", favicon URLs,
+    static.licdn.com/scds/... favicons) so these never get used as the
+    company name / logo.
+  • Added extract_company_from_job_url() — fallback that derives the company
+    name from the job URL slug ("...-at-company-name-1234567890") when
+    LinkedIn's company page is a login wall.
+  • Fixed clean_email(): the previous domain-truncation regex was greedy and
+    matched things like "comtak" as if it were a 6-letter TLD, leaving
+    emails such as "hr.ksa@mammoet.comtak" uncorrected. Now domains are
+    truncated against a list of common TLDs (com, net, org, sa, ae, etc.)
+    so trailing junk after the real TLD is correctly stripped.
+
 v6 changes vs v5:
   • MUCH more thorough company-website crawling:
       - crawl_company_website_deep() now ALSO returns logo, about, address,
@@ -33,7 +53,7 @@ Requirements:
     pip install requests beautifulsoup4 openpyxl pandas sentence-transformers language-tool-python
 
 Usage:
-    python linkedin_job_scraper_v6_paraphrase.py
+    python linkedin_job_scraper_v7.py
 
 Outputs:
     jobs_output.xlsx      — scraped + paraphrased jobs
@@ -248,6 +268,44 @@ def blank_if_linkedin(value: str) -> str:
     return "" if is_linkedin_url(value) else value
 
 # =============================================================================
+#  v7: BAD COMPANY NAME / LOGIN-WALL HELPERS
+# =============================================================================
+
+BAD_COMPANY_NAMES = {
+    "sign in", "linkedin", "join now", "log in", "login",
+    "join linkedin", "welcome back", "",
+}
+
+def is_bad_company_name(name: str) -> bool:
+    """Detect LinkedIn login-wall placeholders masquerading as a company name."""
+    if not name:
+        return True
+    n = name.strip().lower()
+    if n in BAD_COMPANY_NAMES:
+        return True
+    if "linkedin" in n and len(n) < 30:
+        return True
+    return False
+
+def extract_company_from_job_url(job_url: str) -> str:
+    """
+    Fallback: LinkedIn job URLs are typically of the form
+        .../jobs/view/<job-title-slug>-at-<company-slug>-<numeric-id>/
+    Extract <company-slug> and turn it into a readable name.
+    """
+    if not job_url:
+        return ""
+    m = re.search(r"-at-([a-z0-9\-]+)-\d+/?(?:\?.*)?$", job_url, re.I)
+    if not m:
+        return ""
+    slug = m.group(1).replace("-", " ").strip()
+    if not slug:
+        return ""
+    # Title-case but keep common acronyms upper if all-caps in slug originally
+    return " ".join(w.upper() if len(w) <= 3 and w.isalpha() and w == w else w.title()
+                     for w in slug.split()).title()
+
+# =============================================================================
 #  MOJIBAKE / TEXT HELPERS
 # =============================================================================
 
@@ -273,9 +331,38 @@ def sanitize_text(text, is_url=False, is_email=False) -> str:
         return re.sub(r"[ \t\r\n\f\v]+", " ", text).strip()
     text = re.sub(r"#+\s*", "", text)
     text = re.sub(r"\*\*", "", text)
-    text = re.sub(r"[^\x20-\x7E\n\u00C0-\u017F\u2013\u2014\u2018-\u201D\u2022]", "", text)
+    # v7: keep Arabic ranges (U+0600-U+06FF Arabic, U+0750-U+077F Arabic Supplement)
+    # so Arabic-language job descriptions aren't reduced to stray punctuation.
+    text = re.sub(
+        r"[^\x20-\x7E\n\u00C0-\u017F\u0600-\u06FF\u0750-\u077F\u2013\u2014\u2018-\u201D\u2022]",
+        "", text
+    )
     text = re.sub(r"[ \t]+", " ", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+# =============================================================================
+#  v7: LANGUAGE DETECTION HELPERS
+# =============================================================================
+
+_ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F]")
+_LATIN_CHAR_RE  = re.compile(r"[A-Za-z]")
+
+def detect_text_language(text: str) -> str:
+    """
+    Very lightweight heuristic language detector for the purpose of deciding
+    whether to run the English-oriented paraphrase prompts.
+    Returns "ar" if the text is predominantly Arabic, otherwise "en".
+    """
+    if not text:
+        return "en"
+    arabic_chars = len(_ARABIC_CHAR_RE.findall(text))
+    latin_chars  = len(_LATIN_CHAR_RE.findall(text))
+    total = arabic_chars + latin_chars
+    if total == 0:
+        return "en"
+    if arabic_chars / total >= 0.4:
+        return "ar"
+    return "en"
 
 # =============================================================================
 #  NLP TOOLS (lazy init)
@@ -914,6 +1001,16 @@ def clean_description(raw: str) -> str:
         cleaned.append("\n".join(out))
     return re.sub(r" {2,}", " ", "\n\n".join(p for p in cleaned if p.strip())).strip()
 
+# v7: known TLDs used to correctly truncate email domains, fixing cases like
+# "hr.ksa@mammoet.comtak" → "hr.ksa@mammoet.com"
+COMMON_EMAIL_TLDS = [
+    "com","net","org","gov","edu","info","biz","co",
+    "sa","ae","uk","us","in","eg","jo","qa","kw","bh","om","ye","iq","lb","sy",
+    "ma","tn","dz","ly","sd","mu","mr","pk","tr","de","fr","it","es","nl","ch",
+    "io","app","tech","online","store","site","me","name","mobi",
+]
+_TLD_RE_PART = "|".join(sorted(set(COMMON_EMAIL_TLDS), key=len, reverse=True))
+
 def clean_email(raw: str) -> str:
     if not raw: return ""
     em = raw
@@ -932,9 +1029,18 @@ def clean_email(raw: str) -> str:
     at = em.rfind("@")
     if at == -1: return ""
     local, domain = em[:at], em[at+1:]
-    if ".mu" in domain:   domain = re.sub(r"\.mu.*", ".mu", domain, flags=re.I)
-    elif ".uk" in domain: domain = re.sub(r"\.uk.*", ".uk", domain, flags=re.I)
-    else:                 domain = re.sub(r"(\.[a-z]{2,6})[a-z0-9\-_/?#+]*$", r"\1", domain, flags=re.I)
+    if ".mu" in domain:
+        domain = re.sub(r"\.mu.*", ".mu", domain, flags=re.I)
+    elif ".uk" in domain:
+        domain = re.sub(r"\.uk.*", ".uk", domain, flags=re.I)
+    else:
+        # v7: truncate right after the first recognized TLD so trailing junk
+        # (e.g. "comtak" from "mammoet.comtak") is correctly removed.
+        m = re.search(rf"^([a-z0-9.\-]+\.(?:{_TLD_RE_PART}))(?:[a-z0-9].*)?$", domain, re.I)
+        if m:
+            domain = m.group(1)
+        else:
+            domain = re.sub(r"(\.[a-z]{2,6})[a-z0-9\-_/?#+]*$", r"\1", domain, flags=re.I)
     em = local + "@" + domain
     if not em or "@" not in em or "." not in em: return ""
     if not re.match(r"^[a-zA-Z0-9]", em): return ""
@@ -969,12 +1075,15 @@ def clean_logo_url(raw: str) -> str:
     return re.sub(r"[\"')\s]+$", "", raw)
 
 def is_placeholder_logo(url: str) -> bool:
-    """Detect LinkedIn ghost/placeholder logos that shouldn't be trusted."""
+    """Detect LinkedIn ghost/placeholder/login-wall logos that shouldn't be trusted."""
     if not url: return True
     l = url.lower()
     return any(k in l for k in [
         "ghost", "placeholder", "static.licdn.com/aero-v1/sc/h/"
         "9c8pery4andzj6ohjkjp54ms4", "default-company-logo",
+        # v7: LinkedIn login-wall favicon
+        "static.licdn.com/scds/common/u/images/logos/favicons",
+        "favicon",
     ])
 
 # =============================================================================
@@ -2450,12 +2559,12 @@ def extract_experience(text: str) -> str:
     return ""
 
 # =============================================================================
-#  JOB DETAIL SCRAPER  (v6 + paraphrase)
+#  JOB DETAIL SCRAPER  (v7 + paraphrase)
 # =============================================================================
 
 def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) -> dict | None:
     """
-    Scrape a single LinkedIn job (v6 layers) then paraphrase key fields.
+    Scrape a single LinkedIn job (v7 layers) then paraphrase key fields.
     Returns the job dict or None.
     """
     job_id = make_job_id(job_url)
@@ -2507,6 +2616,10 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     raw_desc    = sel_text(".show-more-less-html__markup", ".description__text")
     description = clean_description(raw_desc)
 
+    # v7: detect language of the description so we know whether to run the
+    # English-oriented paraphrase prompts.
+    desc_lang = detect_text_language(description)
+
     salary = ""
     for s in [".compensation__salary",".salary","[class*='salary']","[class*='compensation']"]:
         el = soup.select_one(s)
@@ -2540,9 +2653,31 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
             if v and str(v).strip(): return str(v).strip()
         return ""
 
-    merged_name     = _first(company.get("name"),     job_page_co.get("company_name"),  company_name_fallback)
+    # v7: filter out LinkedIn login-wall placeholders ("Sign in", favicon logo)
+    # before merging, so they never win the _first() priority chain.
+    company_name_li = company.get("name", "")
+    if is_bad_company_name(company_name_li):
+        company_name_li = ""
+
+    company_logo_li = company.get("logo", "")
+    if is_placeholder_logo(company_logo_li):
+        company_logo_li = ""
+
+    company_name_jobpage = job_page_co.get("company_name", "")
+    if is_bad_company_name(company_name_jobpage):
+        company_name_jobpage = ""
+
+    if is_bad_company_name(company_name_fallback):
+        company_name_fallback = ""
+
+    merged_name = _first(
+        company_name_li,
+        company_name_jobpage,
+        company_name_fallback,
+        extract_company_from_job_url(job_url),
+    )
     merged_industry = _first(company.get("industry"), job_page_co.get("company_industry"), linkedin_industry)
-    merged_logo_li  = _first(company.get("logo"),     job_page_co.get("company_logo"))   # raw LinkedIn logo
+    merged_logo_li  = _first(company_logo_li, job_page_co.get("company_logo"))   # raw LinkedIn logo
     merged_website  = _first(company.get("website"),  job_page_co.get("company_website"))
     merged_hq       = _first(company.get("headquarters"), job_page_co.get("company_address"))
     merged_founded  = _first(company.get("founded"),  job_page_co.get("company_founded"))
@@ -2592,6 +2727,18 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
             if phone_note not in (merged_about or ""):
                 merged_about = (merged_about + "\n" + phone_note).strip() if merged_about else phone_note
 
+    # If we still don't have a usable company name (e.g. LinkedIn page was a
+    # login wall AND the job page had nothing), try the website domain itself.
+    if is_bad_company_name(merged_name) and merged_website:
+        try:
+            netloc = urlparse(merged_website).netloc
+            netloc = re.sub(r"^www\.", "", netloc)
+            base   = netloc.split(".")[0]
+            if base:
+                merged_name = base.replace("-", " ").title()
+        except Exception:
+            pass
+
     # ── LOGO: prefer company website logo over LinkedIn's (which is often
     #          missing or a generic placeholder) ─────────────────────────────
     company_site_logo = (deep_enrich.get("logo") if deep_enrich else "") or ""
@@ -2634,13 +2781,18 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     paraphrased_desc  = description
     paraphrased_about = merged_about
 
-    if ENABLE_PARAPHRASE and MISTRAL_API_KEY != "your_mistral_api_key_here":
+    # v7: skip the English-oriented paraphrase prompts for predominantly
+    # Arabic descriptions — they're kept as-is (now correctly preserved by
+    # sanitize_text) and flagged via _lang for manual review/translation.
+    if ENABLE_PARAPHRASE and MISTRAL_API_KEY != "your_mistral_api_key_here" and desc_lang != "ar":
         print(C_BLUE(f"\n  ✍️  Paraphrasing '{title}' ..."))
         paraphrased_title = paraphrase_title(title)
         paraphrased_desc  = paraphrase_description(description)
         if merged_about:
             paraphrased_about = paraphrase_company(merged_about)
         mark_paraphrased(job_id)
+    elif desc_lang == "ar":
+        print(C_DIM("  ⚠️  Paraphrasing skipped (description detected as Arabic)"))
     else:
         print(C_DIM("  ⚠️  Paraphrasing skipped (ENABLE_PARAPHRASE=False or no API key)"))
 
@@ -2675,6 +2827,7 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
         "_jobId":            job_id,
         "_apply_method":     apply_data.get("method", ""),
         "_logo_source":      logo_source,
+        "_lang":             desc_lang,
     }
 
 # =============================================================================
@@ -2837,12 +2990,14 @@ def print_job_verbose(job: dict, index: int, total: int):
     logo_source  = job.get("_logo_source", "")
     orig_title   = job.get("originalTitle", "")
     method       = job.get("_apply_method", "")
+    lang         = job.get("_lang", "")
     print()
     print(C_DIVIDER())
     print(C_HEADER(f"  JOB {index}/{total}"))
     print(C_DIVIDER())
     print(f"  {C_LABEL('Title (original)')}   : {C_VALUE(orig_title)}")
     print(f"  {C_LABEL('Title (paraphrased)')}: {C_GREEN(job.get('jobTitle',''))}")
+    print(f"  {C_LABEL('Language')}           : {lang or C_DIM('—')}")
     print(f"  {C_LABEL('Job Type')}            : {job.get('jobType','')}")
     print(f"  {C_LABEL('Field')}               : {job.get('jobField','') or C_DIM('—')}")
     print(f"  {C_LABEL('Location')}            : {job.get('jobLocation','') or C_DIM('—')}")
@@ -2869,7 +3024,7 @@ def print_job_verbose(job: dict, index: int, total: int):
         preview = (about[:200] + " [...]") if len(about) > 200 else about
         print(f"  {C_LABEL('About')}          : {preview}")
     print()
-    print(f"  {C_BLUE('── DESCRIPTION PREVIEW (paraphrased) ───────────────────')}")
+    print(f"  {C_BLUE('── DESCRIPTION PREVIEW ─────────────────────────────────')}")
     print(desc_indented if desc_indented else C_DIM("   — no description —"))
     print(C_DIVIDER())
 
@@ -3009,15 +3164,17 @@ def craw():
 
     print()
     print(C_HEADER("=" * 72))
-    print(C_HEADER("  LINKEDIN JOB SCRAPER v6 + MISTRAL PARAPHRASE"))
+    print(C_HEADER("  LINKEDIN JOB SCRAPER v7 + MISTRAL PARAPHRASE"))
     print(C_HEADER("=" * 72))
     print(f"  Keywords      : {len(SEARCH_KEYWORDS)}")
     print(f"  Max pages     : {'unlimited' if not MAX_PAGES else MAX_PAGES} per keyword")
     print(f"  Job cap       : {'none' if not JOB_LIMIT else JOB_LIMIT}")
-    print(f"  Paraphrase    : {'✅ enabled' if ENABLE_PARAPHRASE else '❌ disabled'}")
+    print(f"  Paraphrase    : {'✅ enabled' if ENABLE_PARAPHRASE else '❌ disabled'} (skipped for Arabic descriptions)")
     print(f"  Apply/Website : ❌ LinkedIn URLs BLOCKED (blanked)")
     print(f"  Company URL   : ✅ LinkedIn company page URL KEPT")
     print(f"  Logo priority : company-website logo > LinkedIn logo")
+    print(f"  Company name  : LinkedIn page > job page > job-card > URL slug > website domain")
+    print(f"  Email cleanup : known-TLD truncation (fixes '.comtak' style junk)")
     print(f"  NLP available : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
     print(f"  Started       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(C_HEADER("=" * 72))
@@ -3113,7 +3270,7 @@ def craw():
         print(f"    Not found    : {no_apply}")
 
         methods = Counter(j.get("_apply_method", "unknown") for j in jobs)
-        print(f"\n  {C_LABEL('Apply method breakdown (v6):')}")
+        print(f"\n  {C_LABEL('Apply method breakdown (v7):')}")
         for method, count in methods.most_common():
             print(f"    {method:<35} {count}")
 
@@ -3121,6 +3278,11 @@ def craw():
         print(f"\n  {C_LABEL('Logo source breakdown:')}")
         for src, count in logo_sources.most_common():
             print(f"    {src:<25} {count}")
+
+        langs = Counter(j.get("_lang", "unknown") for j in jobs)
+        print(f"\n  {C_LABEL('Description language breakdown:')}")
+        for lang, count in langs.most_common():
+            print(f"    {lang:<10} {count}")
 
         fill_fields = [("companyUrl","Company URL"),("companyName","Company Name"),
                        ("companyIndustry","Company Industry"),("companyLogo","Company Logo"),
