@@ -2,8 +2,8 @@ name: LinkedIn Job Scraper
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # every 2 hours (same as the Apps Script trigger)
-  workflow_dispatch:          # also allow manual runs from the Actions tab
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -24,14 +24,18 @@ jobs:
 
       - name: Run scraper
         env:
-          WP_URL:      ${{ secrets.WP_URL }}
-          WP_USER:     ${{ secrets.WP_USER }}
-          WP_PASSWORD: ${{ secrets.WP_PASSWORD }}
+          MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
+          WP_USERNAME:      ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
+          WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
         run: python linkedin_job_scraper.py
 
       - name: Upload Excel output as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jobs-output-${{ github.run_id }}
-          path: jobs_output.xlsx
+          path: |
+            jobs_output.xlsx
+            processed_jobs.csv
           retention-days: 7
