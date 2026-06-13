@@ -49,8 +49,23 @@ v6 changes vs v5:
   • All v5 crawl improvements retained (deep careers discovery, ATS redirect
     chains, site_info email priority, JSON-LD parsing, etc.)
 
+v7.1 changes (secrets):
+  • All secrets (MISTRAL_API_KEY, WP_USERNAME, WP_APP_PASSWORD, WP_BASE_URL)
+    are now read from environment variables instead of being hardcoded.
+    Set them before running, e.g.:
+
+        export MISTRAL_API_KEY="your_mistral_key"
+        export WP_USERNAME="your_wp_username"
+        export WP_APP_PASSWORD="your_wp_application_password"
+        export WP_BASE_URL="https://mauritius.mimusjobs.com/wp-json/wp/v2/"
+
+    Or use a .env file with python-dotenv (see load_dotenv() call below —
+    install with `pip install python-dotenv` if you want this; it's
+    optional and the script works fine without it as long as the env vars
+    are set some other way).
+
 Requirements:
-    pip install requests beautifulsoup4 openpyxl pandas sentence-transformers language-tool-python
+    pip install requests beautifulsoup4 openpyxl pandas sentence-transformers language-tool-python python-dotenv
 
 Usage:
     python linkedin_job_scraper_v7.py
@@ -74,6 +89,14 @@ import requests
 from bs4 import BeautifulSoup
 import openpyxl
 import pandas as pd
+
+# Optional: load secrets from a local .env file if python-dotenv is installed.
+# This is silent/no-op if the package or file isn't present.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  OPTIONAL heavy deps
@@ -100,21 +123,32 @@ JOB_LIMIT       = 0   # 0 = no cap
 OUTPUT_FILE        = "jobs_output.xlsx"
 PROCESSED_IDS_FILE = "processed_jobs.csv"
 
-# ── WordPress ────────────────────────────────────────────────────────────────
-WP_URL      = "https://mauritius.mimusjobs.com/wp-json/wp/v2/"
-WP_USER     = ""
-WP_PASSWORD = ""
+# ── WordPress (secrets via environment variables — see header docstring) ────
+WP_URL      = os.environ.get("WP_BASE_URL", "")
+WP_USER     = os.environ.get("WP_USERNAME", "")
+WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
 WP_BASE        = WP_URL.rstrip("/")
 WP_JOBS_URL    = f"{WP_BASE}/job_listing"
 WP_COMPANY_URL = f"{WP_BASE}/company"
 WP_MEDIA_URL   = f"{WP_BASE}/media"
 
-# ── Mistral ───────────────────────────────────────────────────────────────────
-MISTRAL_API_KEY = "v5eGIFf8H07IaIBbKHXkBfKfHXklR2eP"   # ← replace
+# ── Mistral (secret via environment variable — see header docstring) ────────
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 MISTRAL_MODEL   = "mistral-small-latest"
 MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 
 ENABLE_PARAPHRASE = True   # set False to skip paraphrasing entirely
+
+# ── Startup checks: warn (don't crash) if secrets are missing ───────────────
+for _var, _val, _feature in [
+    ("MISTRAL_API_KEY", MISTRAL_API_KEY, "paraphrasing"),
+    ("WP_USERNAME",     WP_USER,         "WordPress posting"),
+    ("WP_APP_PASSWORD", WP_PASSWORD,     "WordPress posting"),
+]:
+    if not _val:
+        logging.getLogger(__name__).warning(
+            f"Environment variable {_var} is not set — {_feature} will be disabled/skipped."
+        )
 
 # =============================================================================
 #  KEYWORDS
@@ -428,8 +462,8 @@ def clean_output(text: str) -> str:
 # =============================================================================
 
 def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
-    if not MISTRAL_API_KEY or MISTRAL_API_KEY == "your_mistral_api_key_here":
-        log.warning("Mistral API key not set — skipping paraphrase")
+    if not MISTRAL_API_KEY:
+        log.warning("MISTRAL_API_KEY not set — skipping paraphrase")
         return ""
     try:
         response = requests.post(
@@ -2784,7 +2818,7 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     # v7: skip the English-oriented paraphrase prompts for predominantly
     # Arabic descriptions — they're kept as-is (now correctly preserved by
     # sanitize_text) and flagged via _lang for manual review/translation.
-    if ENABLE_PARAPHRASE and MISTRAL_API_KEY != "your_mistral_api_key_here" and desc_lang != "ar":
+    if ENABLE_PARAPHRASE and MISTRAL_API_KEY and desc_lang != "ar":
         print(C_BLUE(f"\n  ✍️  Paraphrasing '{title}' ..."))
         paraphrased_title = paraphrase_title(title)
         paraphrased_desc  = paraphrase_description(description)
@@ -2794,7 +2828,7 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     elif desc_lang == "ar":
         print(C_DIM("  ⚠️  Paraphrasing skipped (description detected as Arabic)"))
     else:
-        print(C_DIM("  ⚠️  Paraphrasing skipped (ENABLE_PARAPHRASE=False or no API key)"))
+        print(C_DIM("  ⚠️  Paraphrasing skipped (ENABLE_PARAPHRASE=False or MISTRAL_API_KEY not set)"))
 
     return {
         # Paraphrased fields
@@ -2858,6 +2892,10 @@ def get_or_create_term(taxonomy_url: str, name: str) -> int | None:
         return None
 
 def post_job_to_wordpress(job: dict) -> tuple:
+    if not WP_USER or not WP_PASSWORD:
+        log.warning("WP_USERNAME / WP_APP_PASSWORD not set — skipping WordPress post")
+        return None, None
+
     h = _wp_auth_headers()
 
     title       = sanitize_text(job.get("jobTitle", ""))
