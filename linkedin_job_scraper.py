@@ -128,8 +128,8 @@ WP_URL      = os.environ.get("WP_BASE_URL", "")
 WP_USER     = os.environ.get("WP_USERNAME", "")
 WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
 WP_BASE        = WP_URL.rstrip("/")
-WP_JOBS_URL    = f"{WP_BASE}/job_listing"
-WP_COMPANY_URL = f"{WP_BASE}/company"
+WP_JOBS_URL    = f"{WP_BASE}/job-listings"     # ✅
+WP_COMPANY_URL = f"{WP_BASE}/companies"        # ✅
 WP_MEDIA_URL   = f"{WP_BASE}/media"
 
 # ── Mistral (secret via environment variable — see header docstring) ────────
