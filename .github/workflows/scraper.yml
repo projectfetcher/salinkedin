@@ -1,35 +1,40 @@
 name: LinkedIn Job Scraper
-
 on:
   schedule:
     - cron: "0 */2 * * *"
   workflow_dispatch:
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Run scraper
+      - name: Check WP REST routes
         env:
-          MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
-          WP_USERNAME:      ${{ secrets.WP_USERNAME }}
-          WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
-          WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
-        run: python linkedin_job_scraper.py
-
+          WP_BASE_URL:     ${{ secrets.WP_BASE_URL }}
+          WP_USERNAME:     ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+        run: |
+          python - <<'EOF'
+          import os, requests, base64
+          base  = os.environ["WP_BASE_URL"].rstrip("/")
+          user  = os.environ["WP_USERNAME"]
+          pw    = os.environ["WP_APP_PASSWORD"]
+          token = base64.b64encode(f"{user}:{pw}".encode()).decode()
+          headers = {"Authorization": f"Basic {token}"}
+          r = requests.get(base, headers=headers, verify=False)
+          data = r.json()
+          print("=== ALL REGISTERED REST ROUTES ===")
+          for route in sorted(data.get("routes", {}).keys()):
+              print(route)
+          EOF
       - name: Upload Excel output as artifact
         if: always()
         uses: actions/upload-artifact@v4
