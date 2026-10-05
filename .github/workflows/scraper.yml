@@ -3,19 +3,26 @@ on:
   schedule:
     - cron: "26 2,5,8,11,14,17,20,23 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write   # needed to commit the tracker CSV back to the repo
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Run scraper
         env:
           MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
@@ -24,6 +31,16 @@ jobs:
           WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
           INTERNAL_BOT_KEY: ${{ secrets.INTERNAL_BOT_KEY }}
         run: python linkedin_job_scraper.py
+
+      - name: Commit updated tracker CSV
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add processed_jobs_saudi_arabia.csv
+          git diff --cached --quiet || git commit -m "Update processed_jobs_saudi_arabia.csv [skip ci]"
+          git push || true
+
       - name: Upload Excel output as artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -31,5 +48,5 @@ jobs:
           name: jobs-output-${{ github.run_id }}
           path: |
             jobs_output.xlsx
-            processed_jobs.csv
+            processed_jobs_saudi_arabia.csv
           retention-days: 7
