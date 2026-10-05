@@ -5,6 +5,7 @@ import json
 import hashlib
 import logging
 import os
+import subprocess
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote, quote_plus
 
@@ -763,6 +764,37 @@ def mark_posted(job_id, wp_id, wp_url, job: dict | None = None):
 
 def mark_failed(job_id, reason):
     _upsert_row(job_id, {"Status": f"failed|{reason}"})
+
+# ── Immediate tracker sync to the repo (GitHub Actions only) ────────────────
+# Without this, the CSV only reaches the repo after the whole run finishes.
+# With it, the CSV is committed + pushed right after every posted job.
+GIT_PUSH_TRACKER = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+
+def _git(*args, timeout: int = 60):
+    return subprocess.run(["git", *args], capture_output=True, text=True, timeout=timeout)
+
+def push_tracker_now(message: str):
+    """Commit and push the tracker CSV immediately. Never raises."""
+    if not GIT_PUSH_TRACKER:
+        return
+    try:
+        _git("config", "user.name",  "github-actions[bot]")
+        _git("config", "user.email", "github-actions[bot]@users.noreply.github.com")
+        _git("add", PROCESSED_IDS_FILE)
+        if _git("diff", "--cached", "--quiet").returncode == 0:
+            return  # nothing changed
+        _git("commit", "-m", f"{message} [skip ci]")
+        for attempt in range(4):
+            # Rebase first so pushes from other workflows (e.g. Algeria) don't reject ours
+            _git("pull", "--rebase", "--autostash")
+            push = _git("push")
+            if push.returncode == 0:
+                log.info(f"📌 Tracker pushed: {message}")
+                return
+            log.warning(f"Tracker push attempt {attempt+1} failed: {push.stderr.strip()[:200]}")
+            time.sleep(2 + attempt * 2)
+    except Exception as e:
+        log.warning(f"push_tracker_now error: {e}")
 
 # =============================================================================
 #  HELPERS
@@ -3240,9 +3272,11 @@ def craw():
                     if wp_id:
                         mark_posted(job["_jobId"], wp_id, wp_url or "", job)
                         print(C_GREEN(f"  ✅ WP ID={wp_id}  🔗 {wp_url}"))
+                        push_tracker_now(f"Tracker: posted {job['_jobId']}")
                     else:
                         mark_failed(job["_jobId"], "wp_post_failed")
                         print(C_RED("  ❌ WordPress post failed"))
+                        push_tracker_now(f"Tracker: failed {job['_jobId']}")
             else:
                 print(C_RED("  ✗  No title found / skipped"))
         except Exception as e:
