@@ -39,6 +39,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add processed_jobs_saudi_arabia.csv
           git diff --cached --quiet || git commit -m "Update processed_jobs_saudi_arabia.csv [skip ci]"
+          git pull --rebase --autostash || true
           git push || true
 
       - name: Upload Excel output as artifact
